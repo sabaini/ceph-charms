@@ -1,7 +1,7 @@
 series: bionic
 applications:
   ceph-osd:
-    charm: cs:~openstack-charmers-next/ceph-osd
+    charm: cs:~openstack-charmers/ceph-osd
     num_units: 3
     series: bionic
     storage:
@@ -9,6 +9,7 @@ applications:
     options:
       osd-devices: '/dev/test-non-existent'
       source: cloud:bionic-ussuri
+    channel: candidate
   ceph-mon:
     charm: ../../../ceph-mon
     num_units: 3
@@ -16,56 +17,65 @@ applications:
       monitor-count: '3'
       source: cloud:bionic-ussuri
   percona-cluster:
-    charm: cs:~openstack-charmers-next/percona-cluster
+    charm: cs:~openstack-charmers/percona-cluster
     num_units: 1
     options:
       dataset-size: 25%
       max-connections: 1000
       source: cloud:bionic-ussuri
+    channel: candidate
   rabbitmq-server:
-    charm: cs:~openstack-charmers-next/rabbitmq-server
+    charm: cs:~openstack-charmers/rabbitmq-server
     num_units: 1
     options:
       source: cloud:bionic-ussuri
+    channel: candidate
   keystone:
     expose: True
-    charm: cs:~openstack-charmers-next/keystone
+    charm: cs:~openstack-charmers/keystone
     num_units: 1
     options:
       openstack-origin: cloud:bionic-ussuri
+    channel: candidate
   nova-compute:
-    charm: cs:~openstack-charmers-next/nova-compute
+    charm: cs:~openstack-charmers/nova-compute
     num_units: 1
     options:
       openstack-origin: cloud:bionic-ussuri
       libvirt-image-backend: rbd
+    channel: candidate
   glance:
     expose: True
-    charm: cs:~openstack-charmers-next/glance
+    charm: cs:~openstack-charmers/glance
     num_units: 1
     options:
       openstack-origin: cloud:bionic-ussuri
+    channel: candidate
   cinder:
     expose: True
-    charm: cs:~openstack-charmers-next/cinder
+    charm: cs:~openstack-charmers/cinder
     num_units: 1
     options:
       block-device: 'None'
       glance-api-version: '2'
       openstack-origin: cloud:bionic-ussuri
+    channel: candidate
   cinder-ceph:
-    charm: cs:~openstack-charmers-next/cinder-ceph
+    charm: cs:~openstack-charmers/cinder-ceph
+    channel: candidate
   nova-cloud-controller:
     expose: True
-    charm: cs:~openstack-charmers-next/nova-cloud-controller
+    charm: cs:~openstack-charmers/nova-cloud-controller
     num_units: 1
     options:
       openstack-origin: cloud:bionic-ussuri
+    channel: candidate
   placement:
-    charm: cs:~openstack-charmers-next/placement
+    charm: cs:~openstack-charmers/placement
     num_units: 1
     options:
       openstack-origin: cloud:bionic-ussuri
+    channel: candidate
   prometheus2:
 # Pin prometheus2 charm version Bug #1891942
     charm: cs:prometheus2-18

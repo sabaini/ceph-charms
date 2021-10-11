@@ -1,13 +1,14 @@
 series: bionic
 applications:
   ceph-osd:
-    charm: cs:~openstack-charmers-next/ceph-osd
+    charm: cs:~openstack-charmers/ceph-osd
     num_units: 3
     storage:
       osd-devices: '10G'
     options:
       osd-devices: '/dev/test-non-existent'
       source: cloud:bionic-train/proposed
+    channel: candidate
   ceph-mon:
     charm: ../../../ceph-mon
     series: bionic
@@ -17,56 +18,65 @@ applications:
       source: cloud:bionic-train/proposed
       fsid: 3930914c-4fc5-4720-8975-b7bf554f647c
   percona-cluster:
-    charm: cs:~openstack-charmers-next/percona-cluster
+    charm: cs:~openstack-charmers/percona-cluster
     num_units: 1
     options:
       dataset-size: 25%
       max-connections: 1000
       source: cloud:bionic-train/proposed
+    channel: candidate
   rabbitmq-server:
-    charm: cs:~openstack-charmers-next/rabbitmq-server
+    charm: cs:~openstack-charmers/rabbitmq-server
     num_units: 1
     options:
       source: cloud:bionic-train/proposed
+    channel: candidate
   keystone:
     expose: True
-    charm: cs:~openstack-charmers-next/keystone
+    charm: cs:~openstack-charmers/keystone
     num_units: 1
     options:
       openstack-origin: cloud:bionic-train/proposed
+    channel: candidate
   nova-compute:
-    charm: cs:~openstack-charmers-next/nova-compute
+    charm: cs:~openstack-charmers/nova-compute
     num_units: 1
     options:
       openstack-origin: cloud:bionic-train/proposed
       libvirt-image-backend: rbd
+    channel: candidate
   glance:
     expose: True
-    charm: cs:~openstack-charmers-next/glance
+    charm: cs:~openstack-charmers/glance
     num_units: 1
     options:
       openstack-origin: cloud:bionic-train/proposed
+    channel: candidate
   cinder:
     expose: True
-    charm: cs:~openstack-charmers-next/cinder
+    charm: cs:~openstack-charmers/cinder
     num_units: 1
     options:
       block-device: 'None'
       glance-api-version: '2'
       openstack-origin: cloud:bionic-train/proposed
+    channel: candidate
   cinder-ceph:
-    charm: cs:~openstack-charmers-next/cinder-ceph
+    charm: cs:~openstack-charmers/cinder-ceph
+    channel: candidate
   nova-cloud-controller:
     expose: True
-    charm: cs:~openstack-charmers-next/nova-cloud-controller
+    charm: cs:~openstack-charmers/nova-cloud-controller
     num_units: 1
     options:
       openstack-origin: cloud:bionic-train/proposed
+    channel: candidate
   placement:
-    charm: cs:~openstack-charmers-next/placement
+    charm: cs:~openstack-charmers/placement
     num_units: 1
     options:
       openstack-origin: cloud:bionic-train
+    channel: candidate
 relations:
 - - nova-compute:amqp
   - rabbitmq-server:amqp
