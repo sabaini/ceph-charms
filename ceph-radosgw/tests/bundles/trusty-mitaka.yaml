@@ -17,13 +17,11 @@ applications:
     options:
       source: *source
       osd-devices: '/srv/ceph /dev/test-non-existent'
-    channel: candidate
   ceph-mon:
     charm: cs:~openstack-charmers/ceph-mon
     num_units: 3
     options:
       source: *source
-    channel: candidate
   percona-cluster:
     charm: cs:trusty/percona-cluster
     num_units: 1
@@ -33,7 +31,6 @@ applications:
     num_units: 1
     options:
       openstack-origin: *source
-    channel: candidate
 relations:
 - - keystone:shared-db
   - percona-cluster:shared-db

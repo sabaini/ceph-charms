@@ -20,13 +20,11 @@ applications:
       osd-devices: 'cinder,10G'
     options:
       source: *source
-    channel: candidate
   east-ceph-mon:
     charm: cs:~openstack-charmers/ceph-mon
     num_units: 3
     options:
       source: *source
-    channel: candidate
   slave-ceph-radosgw:
     series: bionic
     charm: ../../../ceph-radosgw
@@ -45,17 +43,14 @@ applications:
       osd-devices: 'cinder,10G'
     options:
       source: *source
-    channel: candidate
   west-ceph-mon:
     charm: cs:~openstack-charmers/ceph-mon
     num_units: 3
     options:
       source: *source
-    channel: candidate
   percona-cluster:
     charm: cs:~openstack-charmers/percona-cluster
     num_units: 1
-    channel: candidate
   keystone:
     expose: True
     charm: cs:~openstack-charmers/keystone
@@ -63,7 +58,6 @@ applications:
     options:
       openstack-origin: *source
       region: "east-1 west-1"
-    channel: candidate
 relations:
 - - keystone:shared-db
   - percona-cluster:shared-db
