@@ -33,19 +33,14 @@ applications:
 
   keystone-mysql-router:
     charm: cs:~openstack-charmers/mysql-router
-    channel: candidate
   glance-mysql-router:
     charm: cs:~openstack-charmers/mysql-router
-    channel: candidate
   cinder-mysql-router:
     charm: cs:~openstack-charmers/mysql-router
-    channel: candidate
   nova-cloud-controller-mysql-router:
     charm: cs:~openstack-charmers/mysql-router
-    channel: candidate
   placement-mysql-router:
     charm: cs:~openstack-charmers/mysql-router
-    channel: candidate
 
   mysql-innodb-cluster:
     charm: cs:~openstack-charmers/mysql-innodb-cluster
@@ -56,7 +51,6 @@ applications:
       - '0'
       - '1'
       - '2'
-    channel: candidate
 
   ceph-osd:
     charm: cs:~openstack-charmers/ceph-osd
@@ -70,7 +64,6 @@ applications:
       - '3'
       - '4'
       - '5'
-    channel: candidate
 
   ceph-mon:
     charm: ../../../ceph-mon
@@ -90,7 +83,6 @@ applications:
       source: *openstack-origin
     to:
       - '9'
-    channel: candidate
 
   keystone:
     expose: True
@@ -100,7 +92,6 @@ applications:
       openstack-origin: *openstack-origin
     to:
       - '10'
-    channel: candidate
 
   nova-compute:
     charm: cs:~openstack-charmers/nova-compute
@@ -110,7 +101,6 @@ applications:
       libvirt-image-backend: rbd
     to:
       - '11'
-    channel: candidate
 
   glance:
     expose: True
@@ -120,7 +110,6 @@ applications:
       openstack-origin: *openstack-origin
     to:
       - '12'
-    channel: candidate
 
   cinder:
     expose: True
@@ -132,11 +121,9 @@ applications:
       openstack-origin: *openstack-origin
     to:
       - '13'
-    channel: candidate
 
   cinder-ceph:
     charm: cs:~openstack-charmers/cinder-ceph
-    channel: candidate
 
   nova-cloud-controller:
     expose: True
@@ -146,7 +133,6 @@ applications:
       openstack-origin: *openstack-origin
     to:
       - '14'
-    channel: candidate
 
   placement:
     charm: cs:~openstack-charmers/placement
@@ -155,7 +141,6 @@ applications:
       openstack-origin: *openstack-origin
     to:
       - '15'
-    channel: candidate
 
   prometheus2:
 # Pin prometheus2 charm version Bug #1891942

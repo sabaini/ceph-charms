@@ -35,19 +35,14 @@ applications:
 
   keystone-mysql-router:
     charm: cs:~openstack-charmers/mysql-router
-    channel: candidate
   glance-mysql-router:
     charm: cs:~openstack-charmers/mysql-router
-    channel: candidate
   cinder-mysql-router:
     charm: cs:~openstack-charmers/mysql-router
-    channel: candidate
   nova-cloud-controller-mysql-router:
     charm: cs:~openstack-charmers/mysql-router
-    channel: candidate
   placement-mysql-router:
     charm: cs:~openstack-charmers/mysql-router
-    channel: candidate
 
   mysql-innodb-cluster:
     charm: cs:~openstack-charmers/mysql-innodb-cluster
@@ -58,7 +53,6 @@ applications:
       - '0'
       - '1'
       - '2'
-    channel: candidate
 
   ceph-osd:
     charm: cs:~openstack-charmers/ceph-osd
@@ -74,7 +68,6 @@ applications:
       - '17'
       - '18'
       - '19'
-    channel: candidate
 
   ceph-mon:
     charm: cs:~openstack-charmers/ceph-mon
@@ -86,7 +79,6 @@ applications:
       - '6'
       - '7'
       - '8'
-    channel: candidate
 
   ceph-radosgw:
     charm: cs:~openstack-charmers/ceph-radosgw
@@ -99,7 +91,6 @@ applications:
       ec-profile-m: 2
     to:
       - '20'
-    channel: candidate
 
   rabbitmq-server:
     charm: cs:~openstack-charmers/rabbitmq-server
@@ -108,7 +99,6 @@ applications:
       source: *openstack-origin
     to:
       - '9'
-    channel: candidate
 
   keystone:
     expose: True
@@ -118,7 +108,6 @@ applications:
       openstack-origin: *openstack-origin
     to:
       - '10'
-    channel: candidate
 
   nova-compute:
     charm: cs:~openstack-charmers/nova-compute
@@ -132,7 +121,6 @@ applications:
       libvirt-image-backend: rbd
     to:
       - '11'
-    channel: candidate
 
   glance:
     expose: True
@@ -146,7 +134,6 @@ applications:
       ec-profile-plugin: jerasure
     to:
       - '12'
-    channel: candidate
 
   cinder:
     expose: True
@@ -158,7 +145,6 @@ applications:
       openstack-origin: *openstack-origin
     to:
       - '13'
-    channel: candidate
 
   cinder-ceph:
     charm: cs:~openstack-charmers/cinder-ceph
@@ -168,7 +154,6 @@ applications:
       ec-profile-m: 2
       ec-profile-plugin: lrc
       ec-profile-locality: 3
-    channel: candidate
 
   nova-cloud-controller:
     expose: True
@@ -178,7 +163,6 @@ applications:
       openstack-origin: *openstack-origin
     to:
       - '14'
-    channel: candidate
 
   placement:
     charm: cs:~openstack-charmers/placement
@@ -187,7 +171,6 @@ applications:
       openstack-origin: *openstack-origin
     to:
       - '15'
-    channel: candidate
 
   prometheus2:
 # Pin prometheus2 charm version Bug #1891942
