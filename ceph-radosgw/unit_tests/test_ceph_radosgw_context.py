@@ -63,7 +63,11 @@ class HAProxyContextTests(CharmTestCase):
         self.determine_api_port.return_value = 70
         expect = {
             'cephradosgw_bind_port': 70,
-            'service_ports': {'cephradosgw-server': [80, 70]}
+            'service_ports': {'cephradosgw-server': [80, 70]},
+            'backend_options': {'cephradosgw-server': [{
+                'option': 'httpchk GET /swift/healthcheck',
+            }]},
+            'https': False
         }
         self.assertEqual(expect, haproxy_context())
 

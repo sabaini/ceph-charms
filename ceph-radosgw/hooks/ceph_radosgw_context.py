@@ -22,6 +22,7 @@ from charmhelpers.contrib.openstack import context
 from charmhelpers.contrib.hahelpers.cluster import (
     determine_api_port,
     determine_apache_port,
+    https,
 )
 from charmhelpers.core.host import (
     cmp_pkgrevno,
@@ -68,12 +69,13 @@ class HAProxyContext(context.HAProxyContext):
     def __call__(self):
         ctxt = super(HAProxyContext, self).__call__()
         port = utils.listen_port()
+        service = 'cephradosgw-server'
 
         # Apache ports
         a_cephradosgw_api = determine_apache_port(port, singlenode_mode=True)
 
         port_mapping = {
-            'cephradosgw-server': [port, a_cephradosgw_api]
+            service: [port, a_cephradosgw_api]
         }
 
         ctxt['cephradosgw_bind_port'] = determine_api_port(
@@ -82,7 +84,16 @@ class HAProxyContext(context.HAProxyContext):
         )
 
         # for haproxy.conf
+        backend_options = {
+            service: [{
+                'option': 'httpchk GET /swift/healthcheck',
+            }]
+        }
+
         ctxt['service_ports'] = port_mapping
+        ctxt['backend_options'] = backend_options
+        ctxt['https'] = https()
+
         return ctxt
 
 
