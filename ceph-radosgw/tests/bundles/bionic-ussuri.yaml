@@ -3,13 +3,13 @@ options:
 series: bionic
 applications:
   ceph-radosgw:
-    charm: ceph-radosgw
+    charm: ../../ceph-radosgw.charm
     series: bionic
     num_units: 1
     options:
       source: *source
   ceph-osd:
-    charm: cs:~openstack-charmers/ceph-osd
+    charm: ch:ceph-osd
     num_units: 3
     constraints: "mem=2048"
     storage:
@@ -17,23 +17,27 @@ applications:
     options:
       source: *source
       osd-devices: '/srv/ceph /dev/test-non-existent'
+    channel: octopus/edge
   ceph-mon:
-    charm: cs:~openstack-charmers/ceph-mon
+    charm: ch:ceph-mon
     num_units: 3
     options:
       source: *source
+    channel: octopus/edge
   percona-cluster:
-    charm: cs:~openstack-charmers/percona-cluster
+    charm: ch:percona-cluster
     num_units: 1
   keystone:
     expose: True
-    charm: cs:~openstack-charmers/keystone
+    charm: ch:keystone
     num_units: 1
     options:
       openstack-origin: *source
+    channel: ussuri/edge
   vault:
-    charm: cs:~openstack-charmers/vault
+    charm: ch:vault
     num_units: 1
+    channel: 1.7/edge
 relations:
 - - keystone:shared-db
   - percona-cluster:shared-db

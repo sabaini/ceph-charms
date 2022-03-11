@@ -13,12 +13,8 @@ tags:
 - file-servers
 - misc
 series:
-- xenial
-- bionic
 - focal
-- groovy
-- hirsute
-- impish
+- bionic
 extra-bindings:
   public:
   admin:

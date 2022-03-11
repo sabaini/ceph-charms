@@ -10,3 +10,4 @@ tags
 func-results.json
 .stestr/
 **/__pycache__
+*.charm
