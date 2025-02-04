@@ -102,6 +102,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Copy utils
+        run: cp tests/scripts/actionutils.sh $HOME
+
+      - name: Clear FORWARD firewall rules
+        run: ~/actionutils.sh cleaript
+
       - name: Setup LXD
         run: |
           if [[ "$(snap list | grep -c lxd)" -eq 0 ]]; then
