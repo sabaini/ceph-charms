@@ -21,7 +21,9 @@ from typing import Dict
 import unittest
 import yaml
 import zaza
+import zaza.model as model
 import zaza.utilities.installers
+from tenacity import stop_after_attempt, wait_exponential, retry_if_result
 
 
 class NfsGaneshaTest(unittest.TestCase):
@@ -89,28 +91,31 @@ class NfsGaneshaTest(unittest.TestCase):
         self.assertEqual(action.status, 'completed')
 
     def _mount_share(self, unit_name: str, share_ip: str,
-                     export_path: str, retry: bool = True):
+                     export_path: str, perform_retry: bool = True):
         self._install_dependencies(unit_name)
-        ssh_cmd = (
+        cmd = (
             'sudo mkdir -p {0} && '
             'sudo mount -t {1} -o nfsvers=4.1,proto=tcp {2}:{3} {0}'.format(
                 self.mount_dir,
                 self.share_protocol,
                 share_ip,
                 export_path))
-        if retry:
-            for attempt in tenacity.Retrying(
-                    stop=tenacity.stop_after_attempt(5),
-                    wait=tenacity.wait_exponential(multiplier=3,
-                                                   min=2, max=10)):
-                with attempt:
-                    zaza.utilities.generic.run_via_ssh(
-                        unit_name=unit_name,
-                        cmd=ssh_cmd)
+        if perform_retry:
+            @tenacity.retry(
+                stop=stop_after_attempt(5),
+                wait=wait_exponential(multiplier=3, min=2, max=10),
+                retry=retry_if_result(lambda res: res.get('Code') != '0')
+            )
+            def _do_mount():
+                logging.info(f"Mounting CephFS on {unit_name}")
+                res = model.run_on_unit(unit_name, cmd)
+                logging.info(f"Mount result: {res}")
+                return res
+
+            _do_mount()
         else:
-            zaza.utilities.generic.run_via_ssh(
-                unit_name=unit_name,
-                cmd=ssh_cmd)
+            model.run_on_unit(unit_name, cmd)
+
         self.mounts_share = True
 
     def _install_dependencies(self, unit: str):
@@ -158,7 +163,9 @@ class NfsGaneshaTest(unittest.TestCase):
         self._write_testing_file_on_instance('ceph-osd/0')
         # Todo - enable ACL testing
         try:
-            self._mount_share('ceph-osd/1', ip, export_path, retry=False)
+            self._mount_share(
+                'ceph-osd/1', ip, export_path, perform_retry=False
+            )
             self.fail('Mounting should not have succeeded')
         except:  # noqa: E722
             pass
