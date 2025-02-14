@@ -33,7 +33,7 @@ function setup_functest() {
              localhost localhost
     fi
     sudo snap install --classic juju-crashdump
-
+    cp tests/configs/dot.zaza.yaml ~/.zaza.yaml
 }
 
 run="${1}"

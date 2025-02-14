@@ -48,7 +48,8 @@ applications:
     charm: ch:mysql-router
     channel: latest/edge
   ceph-dashboard:
-    charm: ../../../ceph-dashboard.charm
+    charm: ch:ceph-dashboard
+    channel: latest/edge
     options:
       public-hostname: 'ceph-dashboard.zaza.local'
   prometheus:
