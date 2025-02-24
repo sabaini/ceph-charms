@@ -379,8 +379,9 @@ class TestCephDashboardCharmBase(CharmTestCase):
             '10.0.0.10')
 
     @patch('ceph_dashboard_commands.check_ceph_dashboard_ssl_configured')
+    @patch('ceph_dashboard_commands.set_ssl_material')
     @patch('socket.gethostname')
-    def test_certificates_relation(self, _gethostname, ssl_configured):
+    def test_certificates_relation(self, _gethostname, set_ssl_material, ssl_configured):
         self.ceph_utils.is_dashboard_enabled.return_value = True
         ssl_configured.return_value = False
         mock_TLS_KEY_PATH = MagicMock()
@@ -457,20 +458,11 @@ class TestCephDashboardCharmBase(CharmTestCase):
         mock_TLS_KEY_PATH.write_bytes.assert_called_once()
         self.subprocess.check_call.assert_called_once_with(
             ['update-ca-certificates'])
-        self.ceph_utils.dashboard_set_ssl_certificate.assert_has_calls([
-            call(mock_TLS_CERT_PATH, hostname='server1'),
-            call(mock_TLS_CERT_PATH)])
-        self.ceph_utils.dashboard_set_ssl_certificate_key.assert_has_calls([
-            call(mock_TLS_KEY_PATH, hostname='server1'),
-            call(mock_TLS_KEY_PATH)])
-        self.ceph_utils.mgr_config_set.assert_has_calls([
-            call('mgr/dashboard/standby_behaviour', 'redirect'),
-            call('mgr/dashboard/ssl', 'true')])
-        self.ceph_utils.mgr_disable_dashboard.assert_called_once_with()
-        self.ceph_utils.mgr_enable_dashboard.assert_called_once_with()
+        set_ssl_material.assert_called_with(mock_TLS_KEY_PATH, mock_TLS_CERT_PATH)
 
+    @patch('ceph_dashboard_commands.set_ssl_material')
     @patch('ceph_dashboard_commands.check_ceph_dashboard_ssl_configured')
-    def test_certificates_from_config(self, ssl_configured):
+    def test_certificates_from_config(self, ssl_configured, set_ssl_material):
         self.ceph_utils.is_dashboard_enabled.return_value = True
         ssl_configured.return_value = False
         mock_TLS_KEY_PATH = MagicMock()
@@ -490,25 +482,12 @@ class TestCephDashboardCharmBase(CharmTestCase):
         self.harness.charm.TLS_CERT_PATH = mock_TLS_CERT_PATH
         self.harness.charm.TLS_CHARM_CA_CERT_PATH = mock_TLS_CHARM_CA_CERT_PATH
         self.harness.charm.TLS_KEY_PATH = mock_TLS_KEY_PATH
-        self.subprocess.check_call.reset_mock()
         self.harness.update_config(
             key_values={
                 'ssl_key': base64.b64encode(TEST_KEY.encode("utf-8")),
                 'ssl_cert': base64.b64encode(TEST_CERT.encode("utf-8")),
                 'ssl_ca': base64.b64encode(TEST_CA.encode("utf-8"))})
-        self.subprocess.check_call.assert_called_once_with(
-            ['update-ca-certificates'])
-        self.ceph_utils.dashboard_set_ssl_certificate.assert_has_calls([
-            call(mock_TLS_CERT_PATH, hostname='server1'),
-            call(mock_TLS_CERT_PATH)])
-        self.ceph_utils.dashboard_set_ssl_certificate_key.assert_has_calls([
-            call(mock_TLS_KEY_PATH, hostname='server1'),
-            call(mock_TLS_KEY_PATH)])
-        self.ceph_utils.mgr_config_set.assert_has_calls([
-            call('mgr/dashboard/standby_behaviour', 'redirect'),
-            call('mgr/dashboard/ssl', 'true')])
-        self.ceph_utils.mgr_disable_dashboard.assert_called_once_with()
-        self.ceph_utils.mgr_enable_dashboard.assert_called_once_with()
+        set_ssl_material.assert_called_with(mock_TLS_KEY_PATH, mock_TLS_CERT_PATH)
 
     @patch('ceph_dashboard_commands.subprocess')
     def test_rados_gateway(self, subprocess):
