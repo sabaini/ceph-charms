@@ -1,0 +1,12 @@
+bin
+.idea
+.coverage
+.testrepository
+.tox
+*.sw[nop]
+.idea
+*.pyc
+func-results.json
+.stestr
+__pycache__
+*.charm
