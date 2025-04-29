@@ -1,0 +1,12 @@
+- project:
+    templates:
+      - charm-unit-jobs-py38
+      - charm-unit-jobs-py36
+    check:
+      jobs:
+        - focal-ussuri
+        - bionic-ussuri
+    vars:
+      needs_charm_build: true
+      charm_build_name: ceph-rbd-mirror
+      build_type: charmcraft
