@@ -3,7 +3,7 @@ import json
 import unittest
 import sys
 
-from mock import patch, MagicMock, DEFAULT, call
+from unittest.mock import patch, MagicMock, DEFAULT, call
 
 # python-apt is not installed as part of test-requirements but is imported by
 # some charmhelpers modules so create a fake import.
