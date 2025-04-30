@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.append('lib')  # noqa
 sys.path.append('src')  # noqa
 
-from mock import call, patch, MagicMock, ANY, Mock
+from unittest.mock import call, patch, MagicMock, ANY, Mock
 
 from ops.testing import Harness, _TestingModelBackend
 from ops.model import (
