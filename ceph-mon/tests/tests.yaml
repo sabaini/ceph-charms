@@ -1,0 +1,22 @@
+charm_name: ceph-mon
+
+gate_bundles:
+  - focal-ussuri-ec
+  - focal-ussuri
+
+smoke_bundles:
+  - focal-ussuri
+
+configure:
+  - zaza.openstack.charm_tests.glance.setup.add_lts_image
+
+tests:
+  - zaza.openstack.charm_tests.ceph.tests.CheckPoolTypes
+  - zaza.openstack.charm_tests.ceph.tests.CephLowLevelTest
+  - zaza.openstack.charm_tests.ceph.tests.CephRelationTest
+  - zaza.openstack.charm_tests.ceph.tests.CephTest
+  - zaza.openstack.charm_tests.ceph.osd.tests.SecurityTest
+  - zaza.openstack.charm_tests.ceph.tests.CephPrometheusTest
+
+tests_options:
+  force_deploy: []

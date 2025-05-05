@@ -1,0 +1,24 @@
+charm_name: ceph-fs
+gate_bundles:
+  - bluestore-compression: focal-ussuri
+dev_bundles:
+smoke_bundles:
+configure:
+  - zaza.openstack.charm_tests.glance.setup.add_lts_image
+  - zaza.openstack.charm_tests.neutron.setup.basic_overcloud_network
+  - zaza.openstack.charm_tests.nova.setup.create_flavors
+  - zaza.openstack.charm_tests.nova.setup.manage_ssh_key
+  - zaza.openstack.charm_tests.keystone.setup.add_demo_user
+  - bluestore-compression:
+    - zaza.openstack.charm_tests.glance.setup.add_lts_image
+    - zaza.openstack.charm_tests.neutron.setup.basic_overcloud_network
+    - zaza.openstack.charm_tests.nova.setup.create_flavors
+    - zaza.openstack.charm_tests.nova.setup.manage_ssh_key
+    - zaza.openstack.charm_tests.keystone.setup.add_demo_user
+tests:
+  - zaza.openstack.charm_tests.ceph.fs.tests.CephFSTests
+  - zaza.openstack.charm_tests.ceph.fs.tests.CharmOperationTest
+  - bluestore-compression:
+    - zaza.openstack.charm_tests.ceph.fs.tests.CephFSTests
+    - zaza.openstack.charm_tests.ceph.fs.tests.CharmOperationTest
+    - zaza.openstack.charm_tests.ceph.tests.BlueStoreCompressionCharmOperation

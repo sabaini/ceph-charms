@@ -1,0 +1,126 @@
+series: bionic
+applications:
+  mysql:
+    charm: ch:percona-cluster
+    num_units: 1
+    options:
+      source: cloud:bionic-ussuri
+  keystone:
+    charm: ch:keystone
+    num_units: 1
+    options:
+      openstack-origin: cloud:bionic-ussuri
+    channel: ussuri/candidate
+  rabbitmq-server:
+    charm: ch:rabbitmq-server
+    num_units: 1
+    options:
+      source: cloud:bionic-ussuri
+    channel: 3.8/candidate
+  cinder:
+    charm: ch:cinder
+    num_units: 1
+    options:
+      block-device: None
+      glance-api-version: 2
+      openstack-origin: cloud:bionic-ussuri
+  cinder-ceph:
+    charm: ch:cinder-ceph
+    num_units: 0
+    options:
+      rbd-mirroring-mode: image
+  glance:
+    charm: ch:glance
+    num_units: 1
+    options:
+      openstack-origin: cloud:bionic-ussuri
+  nova-compute:
+    charm: ch:nova-compute
+    num_units: 1
+    options:
+      openstack-origin: cloud:bionic-ussuri
+  ceph-mon:
+    charm: ch:ceph-mon
+    num_units: 3
+    options:
+      expected-osd-count: 3
+      source: cloud:bionic-ussuri
+    channel: octopus/candidate
+  ceph-osd:
+    charm: ch:ceph-osd
+    num_units: 3
+    options:
+      source: cloud:bionic-ussuri
+      #bluestore: False
+      #use-direct-io: False
+    storage:
+      osd-devices: '10G'
+    channel: octopus/candidate
+  ceph-rbd-mirror:
+    series: bionic
+    charm: ../../../ceph-rbd-mirror.charm
+    num_units: 1
+    options:
+      source: cloud:bionic-ussuri
+  ceph-mon-b:
+    charm: ch:ceph-mon
+    num_units: 3
+    options:
+      expected-osd-count: 3
+      source: cloud:bionic-ussuri
+    channel: octopus/candidate
+  ceph-osd-b:
+    charm: ch:ceph-osd
+    num_units: 3
+    options:
+      source: cloud:bionic-ussuri
+      #bluestore: False
+      #use-direct-io: False
+    storage:
+      osd-devices: '10G'
+    channel: octopus/candidate
+  ceph-rbd-mirror-b:
+    series: bionic
+    charm: ../../../ceph-rbd-mirror.charm
+    num_units: 1
+    options:
+      source: cloud:bionic-ussuri
+relations:
+- - mysql
+  - keystone
+- - mysql
+  - cinder
+- - mysql
+  - glance
+- - rabbitmq-server
+  - cinder
+- - keystone
+  - cinder
+- - keystone
+  - glance
+- - cinder
+  - cinder-ceph
+- - cinder-ceph:ceph
+  - ceph-mon:client
+- - nova-compute:ceph-access
+  - cinder-ceph:ceph-access
+- - nova-compute:amqp
+  - rabbitmq-server:amqp
+- - glance:image-service
+  - nova-compute:image-service
+- - glance
+  - ceph-mon
+- - ceph-mon:osd
+  - ceph-osd:mon
+- - ceph-mon
+  - ceph-rbd-mirror:ceph-local
+- - ceph-mon
+  - ceph-rbd-mirror-b:ceph-remote
+- - ceph-mon-b:osd
+  - ceph-osd-b:mon
+- - ceph-mon-b
+  - ceph-rbd-mirror-b:ceph-local
+- - ceph-mon-b
+  - ceph-rbd-mirror:ceph-remote
+- - cinder-ceph:ceph-replication-device
+  - ceph-mon-b:client

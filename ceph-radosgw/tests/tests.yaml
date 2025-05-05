@@ -1,0 +1,35 @@
+charm_name: ceph-radosgw
+
+gate_bundles:
+  - vault: bionic-train
+  - vault: bionic-train-namespaced
+  - vault: bionic-ussuri
+  - vault: bionic-ussuri-namespaced
+  - vault: focal-ussuri-ec
+  - vault: focal-ussuri
+  - vault: focal-ussuri-namespaced
+
+smoke_bundles:
+  - vault: focal-ussuri
+
+dev_bundles: []
+
+target_deploy_status:
+  vault:
+    workload-status: blocked
+    workload-status-message: Vault needs to be initialized
+
+configure:
+  - vault:
+    - zaza.openstack.charm_tests.vault.setup.auto_initialize
+
+tests:
+  - zaza.openstack.charm_tests.ceph.tests.CephRGWTest
+  - vault:
+    - zaza.openstack.charm_tests.ceph.tests.CephRGWTest
+    - zaza.openstack.charm_tests.swift.tests.S3APITest
+    - zaza.openstack.charm_tests.ceph.tests.CheckPoolTypes
+    - zaza.openstack.charm_tests.ceph.tests.BlueStoreCompressionCharmOperation
+
+tests_options:
+  force_deploy: []

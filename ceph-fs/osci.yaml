@@ -1,0 +1,20 @@
+- project:
+    templates:
+      - charm-unit-jobs-py38
+    check:
+      jobs:
+        - focal-ussuri-bluestore
+    vars:
+      needs_charm_build: true
+      charm_build_name: ceph-fs
+      build_type: charmcraft
+
+- job:
+    name: focal-ussuri-bluestore
+    parent: func-target
+    dependencies:
+      - osci-lint
+      - tox-py38
+      - charm-build
+    vars:
+      tox_extra_args: bluestore-compression:focal-ussuri
