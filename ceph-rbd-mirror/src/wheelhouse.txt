@@ -3,3 +3,5 @@ psutil
 git+https://github.com/openstack/charms.openstack.git#egg=charms.openstack
 # https://github.com/canonical/charms.reactive/pull/260
 git+https://github.com/canonical/charms.reactive.git#egg=charms.reactive
+# https://github.com/di/calver/pull/21
+calver==2025.3.31
