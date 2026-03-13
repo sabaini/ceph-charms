@@ -12,7 +12,7 @@ on:
 jobs:
   terraform-integration:
     name: Terraform integration tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, amd64, X64, xlarge, noble]
     timeout-minutes: 120
 
     steps:
