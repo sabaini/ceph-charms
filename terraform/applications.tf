@@ -16,6 +16,8 @@ module "ceph_mon" {
   resources         = var.ceph_mon.resources
   revision          = var.ceph_mon.revision
   units             = var.ceph_mon.units
+
+  depends_on = [terraform_data.validate_model_target]
 }
 
 module "ceph_osd" {
@@ -32,6 +34,8 @@ module "ceph_osd" {
   revision           = var.ceph_osd.revision
   storage_directives = var.ceph_osd.storage_directives
   units              = var.ceph_osd.units
+
+  depends_on = [terraform_data.validate_model_target]
 }
 
 module "ceph_radosgw" {
@@ -47,4 +51,6 @@ module "ceph_radosgw" {
   resources         = var.ceph_radosgw.resources
   revision          = var.ceph_radosgw.revision
   units             = var.ceph_radosgw.units
+
+  depends_on = [terraform_data.validate_model_target]
 }

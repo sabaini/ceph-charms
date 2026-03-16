@@ -171,7 +171,7 @@ variable "expose_endpoints" {
 }
 
 variable "model_name" {
-  description = "Name of an existing Juju model where this component is deployed. Used when model_uuid is not set."
+  description = "Name of an existing Juju model where this component is deployed. Set exactly one of model_name or model_uuid."
   type        = string
   default     = null
 }
@@ -183,7 +183,7 @@ variable "model_owner" {
 }
 
 variable "model_uuid" {
-  description = "UUID of an existing Juju model where this component is deployed. Provide this or model_name/model_owner."
+  description = "UUID of an existing Juju model where this component is deployed. Set exactly one of model_uuid or model_name/model_owner."
   type        = string
   default     = null
 }

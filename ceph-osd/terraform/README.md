@@ -25,7 +25,7 @@ CC008-style charm module for deploying the `ceph-osd` charm with the Juju Terraf
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `base` | `string` | `null` | Base used for deployment, e.g. `ubuntu@24.04`. |
+| `base` | `string` | `"ubuntu@24.04"` | Base used for deployment, e.g. `ubuntu@24.04`. |
 | `resources` | `map(string)` | `{}` | Resources to use with the charm. |
 | `storage_directives` | `map(string)` | `{}` | Storage directives to pass to Juju. |
 | `offered_endpoints` | `list(string)` | `[]` | List of provides endpoint aliases to publish as Juju offers. |

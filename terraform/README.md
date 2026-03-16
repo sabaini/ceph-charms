@@ -71,6 +71,8 @@ Charm objects include at least: `channel`, `base`, and `revision` (plus standard
 | `model_name` | `string` | Name of the Juju model to resolve when `model_uuid` is not set. |
 | `model_owner` | `string` | Model owner used with `model_name` lookup (default: `admin`). |
 
+Exactly one non-empty model target must be provided: `model_uuid` or `model_name` (with optional `model_owner`).
+
 ### Optional
 
 | Name | Type | Description |

@@ -106,6 +106,8 @@ OFFER_EXPOSURE_CASES = (
 )
 
 EXPOSE_ENDPOINTS_VALIDATION_ERROR = "expose_endpoints entries must be valid"
+MODEL_TARGET_VALIDATION_ERROR = "Exactly one model target must be provided"
+TEST_MODEL_UUID = "00000000-0000-0000-0000-000000000001"
 
 
 def _radosgw_related_to_mon(status: jubilant.Status) -> bool:
@@ -253,7 +255,13 @@ terraform {{
 provider "juju" {{}}
 
 variable "model_name" {{
-  type = string
+  type    = string
+  default = null
+}}
+
+variable "model_uuid" {{
+  type    = string
+  default = null
 }}
 
 variable "bootstrap_source" {{
@@ -280,6 +288,7 @@ module "ceph" {{
   source = {json.dumps(str(module_source))}
 
   model_name       = var.model_name
+  model_uuid       = var.model_uuid
   bootstrap_source = var.bootstrap_source
   secrets_storage  = var.secrets_storage
   expose_endpoints = var.expose_endpoints
@@ -651,3 +660,37 @@ class TestTerraformOptionalInputWiring:
 
         details = f"{exc_info.value.output or ''}\n{exc_info.value.stderr or ''}"
         assert EXPOSE_ENDPOINTS_VALIDATION_ERROR in details
+
+    def test_missing_model_target_fails_validation(
+        self,
+        terraform_controller: TerraformController,
+    ) -> None:
+        with pytest.raises(subprocess.CalledProcessError) as exc_info:
+            terraform_controller.plan(
+                out="invalid-missing-model-target.tfplan",
+                extra_args=[
+                    "-var",
+                    f"model_name={json.dumps('')}",
+                    "-var",
+                    f"model_uuid={json.dumps('')}",
+                ],
+            )
+
+        details = f"{exc_info.value.output or ''}\n{exc_info.value.stderr or ''}"
+        assert MODEL_TARGET_VALIDATION_ERROR in details
+
+    def test_multiple_model_targets_fail_validation(
+        self,
+        terraform_controller: TerraformController,
+    ) -> None:
+        with pytest.raises(subprocess.CalledProcessError) as exc_info:
+            terraform_controller.plan(
+                out="invalid-multiple-model-targets.tfplan",
+                extra_args=[
+                    "-var",
+                    f"model_uuid={json.dumps(TEST_MODEL_UUID)}",
+                ],
+            )
+
+        details = f"{exc_info.value.output or ''}\n{exc_info.value.stderr or ''}"
+        assert MODEL_TARGET_VALIDATION_ERROR in details
