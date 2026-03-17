@@ -392,14 +392,32 @@ def get_upgrade_key():
 
 def _config_user_key(name):
     user_keys_list = config('user-keys')
-    if user_keys_list:
-        for ukpair in user_keys_list.split(' '):
-            uk = ukpair.split(':')
-            if len(uk) == 2:
-                user_type, k = uk
-                t, u = user_type.split('.')
-                if u == name:
-                    return k
+    if not user_keys_list:
+        return None
+
+    for ukpair in user_keys_list.split():
+        if ':' not in ukpair:
+            log('Ignoring malformed user-keys entry', level=WARNING)
+            continue
+
+        user_type, key = ukpair.split(':', 1)
+        if not user_type or not key:
+            log('Ignoring malformed user-keys entry', level=WARNING)
+            continue
+
+        if '.' in user_type:
+            _, user = user_type.split('.', 1)
+        else:
+            user = user_type
+
+        if not user:
+            log('Ignoring malformed user-keys entry', level=WARNING)
+            continue
+
+        if user == name:
+            return key
+
+    return None
 
 
 def get_named_entity_key(name, caps=None, pool_list=None,
@@ -478,6 +496,9 @@ def get_named_key(name, caps=None, pool_list=None):
     :param pool_list: The list of pools to give access to
     :returns: Returns a cephx key
     """
+    config_user_key = _config_user_key(name)
+    if config_user_key:
+        return config_user_key
     return get_named_entity_key(name, caps, pool_list, entity='client')
 
 

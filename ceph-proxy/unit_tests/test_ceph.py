@@ -42,12 +42,88 @@ class CephTestCase(unittest.TestCase):
         self.assertEqual(user_key, named_key)
 
     @mock.patch('ceph.config')
+    def test_config_user_key_supports_entity_with_multiple_dots(
+            self,
+            mock_config):
+        user_name = 'radosgw.gateway'
+        user_key = 'AQBljmtb65mrHhAAGy9VRkfsatWVLb9EpoWDfw=='
+
+        mock_config.side_effect = self.populated_config_side_effect
+        named_key = ceph._config_user_key(user_name)
+        self.assertEqual(user_key, named_key)
+
+    @mock.patch('ceph.config')
+    def test_config_user_key_supports_unqualified_username(self, mock_config):
+        user_name = 'glance'
+        user_key = 'AQCnjmtbuEACMxAA7joUmgLIGI4/3LKkPzUy8g=='
+
+        mock_config.side_effect = lambda key: {
+            'user-keys': 'glance:{} client.cinder-ceph:other'.format(user_key),
+            'admin-user': 'client.myadmin',
+        }[key]
+        named_key = ceph._config_user_key(user_name)
+        self.assertEqual(user_key, named_key)
+
+    @mock.patch('ceph.log')
+    @mock.patch('ceph.config')
+    def test_config_user_key_ignores_malformed_entries(
+            self,
+            mock_config,
+            mock_log):
+        user_name = 'glance'
+        user_key = 'AQCnjmtbuEACMxAA7joUmgLIGI4/3LKkPzUy8g=='
+
+        mock_config.side_effect = lambda key: {
+            'user-keys': (
+                'malformed-entry '
+                'client.radosgw.gateway '
+                'client.glance:{}'
+            ).format(user_key),
+            'admin-user': 'client.myadmin',
+        }[key]
+        named_key = ceph._config_user_key(user_name)
+        self.assertEqual(user_key, named_key)
+        self.assertTrue(mock_log.called)
+
+    @mock.patch('ceph.config')
     def test_config_empty_user_key(self, mock_config):
         user_name = 'cinder-ceph'
 
         mock_config.side_effect = self.empty_config_side_effect
         named_key = ceph._config_user_key(user_name)
         self.assertEqual(named_key, None)
+
+    @mock.patch('ceph.get_named_entity_key')
+    @mock.patch('ceph.config')
+    def test_get_named_key_falls_back_when_user_keys_are_malformed(
+            self, mock_config, mock_get_named_entity_key):
+        user_name = 'cinder-ceph'
+        expected_key = 'generated-key'
+
+        mock_config.side_effect = lambda key: {
+            'user-keys': 'broken-entry client.glance',
+            'admin-user': 'client.myadmin',
+        }[key]
+        mock_get_named_entity_key.return_value = expected_key
+
+        named_key = ceph.get_named_key(user_name)
+
+        self.assertEqual(expected_key, named_key)
+        mock_get_named_entity_key.assert_called_once_with(
+            user_name, None, None, entity='client')
+
+    @mock.patch('ceph.get_named_entity_key')
+    @mock.patch('ceph.config')
+    def test_get_named_key_prefers_configured_user_key(
+            self, mock_config, mock_get_named_entity_key):
+        user_name = 'glance'
+        expected_key = 'AQCnjmtbuEACMxAA7joUmgLIGI4/3LKkPzUy8g=='
+
+        mock_config.side_effect = self.populated_config_side_effect
+        named_key = ceph.get_named_key(user_name)
+
+        self.assertEqual(expected_key, named_key)
+        mock_get_named_entity_key.assert_not_called()
 
     @mock.patch.object(ceph, 'ceph_user')
     @mock.patch('subprocess.check_output')
@@ -69,7 +145,6 @@ class CephTestCase(unittest.TestCase):
         mock_config.side_effect = self.empty_config_side_effect
         mock_check_output.side_effect = check_output_side_effect
         named_key = ceph.get_named_key(user_name)
-        print(named_key)
 
         self.assertEqual(expected_key, named_key)
 
