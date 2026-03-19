@@ -120,12 +120,13 @@ def get_broker_service():
     The charm config stores ``admin-user`` as a ceph entity name (e.g.
     ``client.admin`` or ``client.anbox``), while the ceph/rados CLI ``--id``
     argument expects only the id portion (e.g. ``admin`` or ``anbox``).
+
+    Strip only the literal ``client.`` prefix when present. Any other value is
+    treated as an already-qualified id and returned unchanged.
     """
     admin_user = (config('admin-user') or 'client.admin').strip()
     if admin_user.startswith('client.'):
-        admin_user = admin_user.split('client.', 1)[1]
-    elif '.' in admin_user:
-        admin_user = admin_user.split('.', 1)[1]
+        admin_user = admin_user[len('client.'):]
 
     return admin_user or 'admin'
 

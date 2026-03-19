@@ -28,6 +28,11 @@ class CephBrokerTest(unittest.TestCase):
         mock_config.return_value = ''
         self.assertEqual('admin', broker.get_broker_service())
 
+    @mock.patch('charms_ceph.broker.config')
+    def test_get_broker_service_keeps_dotted_id(self, mock_config):
+        mock_config.return_value = 'radosgw.gateway'
+        self.assertEqual('radosgw.gateway', broker.get_broker_service())
+
     @mock.patch('charms_ceph.broker.handle_replicated_pool')
     @mock.patch('charms_ceph.broker.config')
     def test_process_requests_v1_uses_configured_admin_service(
