@@ -3,6 +3,8 @@
 
 """Shared helpers for repo-level integration tests."""
 
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -13,9 +15,25 @@ DEFAULT_TIMEOUT = 60 * 30
 
 def find_repo_root(start: Path) -> Path:
     """Locate the repository root from *start*."""
-    for path in (start, *start.parents):
+    search_start = start if start.is_dir() else start.parent
+
+    if git_executable := shutil.which("git"):
+        try:
+            result = subprocess.run(
+                [git_executable, "rev-parse", "--show-toplevel"],
+                cwd=search_start,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return Path(result.stdout.strip())
+        except (subprocess.CalledProcessError, OSError):
+            pass
+
+    for path in (search_start, *search_start.parents):
         if (path / ".git").exists() and (path / "terraform").is_dir():
             return path
+
     raise FileNotFoundError("Could not find repository root")
 
 
