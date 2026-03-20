@@ -15,6 +15,7 @@ configure:
 tests:
   - zaza.charm_tests.lifecycle.refresh.CharmRefreshAll
   - tests.target.CephProxyTest
+  - tests.target.CephProxyUserKeyTests
   - tests.target.CephFSWithCephProxyTests
 
 target_deploy_status:
