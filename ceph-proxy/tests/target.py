@@ -28,32 +28,52 @@ import zaza.openstack.utilities.exceptions as zaza_exceptions
 JOHNNY_KEY = 'AQCnjmtbuEACMxAA7joUmgLIGI4/3LKkPzUy8g=='
 
 
-def setup_ceph_proxy():
-    """
-    Configure ceph proxy with ceph metadata.
+@tenacity.retry(
+    wait=tenacity.wait_exponential(multiplier=1, min=2, max=10),
+    stop=tenacity.stop_after_attempt(10),
+    reraise=True,
+)
+def _get_proxy_config():
+    """Return Ceph metadata for configuring ceph-proxy."""
+    admin_key_result = zaza_model.run_on_leader(
+        'ceph-mon',
+        'sudo ceph auth get-key client.admin',
+    )
+    fsid_result = zaza_model.run_on_leader(
+        'ceph-mon',
+        'sudo ceph fsid',
+    )
+    admin_key = admin_key_result.get('Stdout', '').strip()
+    fsid = fsid_result.get('Stdout', '').strip()
+    cluster_ips = [ip for ip in zaza_model.get_app_ips('ceph-mon') if ip]
 
-    Fetches admin_keyring and FSID from ceph-mon and
-    uses those to configure ceph-proxy.
-    """
-    raw_admin_keyring = zaza_model.run_on_leader(
-        "ceph-mon", 'cat /etc/ceph/ceph.client.admin.keyring')["Stdout"]
-    admin_keyring = [
-        line for line in raw_admin_keyring.split("\n") if "key" in line
-    ][0].split(' = ')[-1].rstrip()
-    fsid = zaza_model.run_on_leader("ceph-mon", "leader-get fsid")["Stdout"]
-    cluster_ips = zaza_model.get_app_ips("ceph-mon")
+    if admin_key_result.get('Code') != '0' or not admin_key:
+        raise AssertionError(
+            'Unable to fetch client.admin key from ceph-mon leader: '
+            f"{admin_key_result}"
+        )
+    if fsid_result.get('Code') != '0' or not fsid:
+        raise AssertionError(
+            'Unable to fetch fsid from ceph-mon leader: '
+            f"{fsid_result}"
+        )
+    if not cluster_ips:
+        raise AssertionError('Unable to determine ceph-mon application IPs')
 
-    proxy_config = {
+    return {
         'auth-supported': 'cephx',
-        'admin-key': admin_keyring,
+        'admin-key': admin_key,
         'fsid': fsid,
         'monitor-hosts': ' '.join(cluster_ips),
         'user-keys': 'client.johnny:{}'.format(JOHNNY_KEY),
     }
 
-    logging.debug('Config: {}'.format(proxy_config))
 
-    zaza_model.set_application_config("ceph-proxy", proxy_config)
+def setup_ceph_proxy():
+    """Configure ceph-proxy with metadata from the backing Ceph cluster."""
+    proxy_config = _get_proxy_config()
+    logging.info('Configuring ceph-proxy with %s', proxy_config)
+    zaza_model.set_application_config('ceph-proxy', proxy_config)
 
 
 def _get_relation_info(unit_name: str, endpoint: str,
