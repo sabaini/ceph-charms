@@ -25,31 +25,81 @@ import zaza.openstack.utilities.ceph as zaza_ceph
 import zaza.openstack.utilities.exceptions as zaza_exceptions
 
 
-def setup_ceph_proxy():
-    """
-    Configure ceph proxy with ceph metadata.
+JOHNNY_KEY = 'AQCnjmtbuEACMxAA7joUmgLIGI4/3LKkPzUy8g=='
 
-    Fetches admin_keyring and FSID from ceph-mon and
-    uses those to configure ceph-proxy.
-    """
-    raw_admin_keyring = zaza_model.run_on_leader(
-        "ceph-mon", 'cat /etc/ceph/ceph.client.admin.keyring')["Stdout"]
-    admin_keyring = [
-        line for line in raw_admin_keyring.split("\n") if "key" in line
-    ][0].split(' = ')[-1].rstrip()
-    fsid = zaza_model.run_on_leader("ceph-mon", "leader-get fsid")["Stdout"]
-    cluster_ips = zaza_model.get_app_ips("ceph-mon")
 
-    proxy_config = {
+@tenacity.retry(
+    wait=tenacity.wait_exponential(multiplier=1, min=2, max=10),
+    stop=tenacity.stop_after_attempt(10),
+    reraise=True,
+)
+def _get_proxy_config():
+    """Return Ceph metadata for configuring ceph-proxy."""
+    admin_key_result = zaza_model.run_on_leader(
+        'ceph-mon',
+        'sudo ceph auth get-key client.admin',
+    )
+    fsid_result = zaza_model.run_on_leader(
+        'ceph-mon',
+        'sudo ceph fsid',
+    )
+    admin_key = admin_key_result.get('Stdout', '').strip()
+    fsid = fsid_result.get('Stdout', '').strip()
+    cluster_ips = [ip for ip in zaza_model.get_app_ips('ceph-mon') if ip]
+
+    if admin_key_result.get('Code') != '0' or not admin_key:
+        raise AssertionError(
+            'Unable to fetch client.admin key from ceph-mon leader: '
+            f"{admin_key_result}"
+        )
+    if fsid_result.get('Code') != '0' or not fsid:
+        raise AssertionError(
+            'Unable to fetch fsid from ceph-mon leader: '
+            f"{fsid_result}"
+        )
+    if not cluster_ips:
+        raise AssertionError('Unable to determine ceph-mon application IPs')
+
+    return {
         'auth-supported': 'cephx',
-        'admin-key': admin_keyring,
+        'admin-key': admin_key,
         'fsid': fsid,
-        'monitor-hosts': ' '.join(cluster_ips)
+        'monitor-hosts': ' '.join(cluster_ips),
+        'user-keys': 'client.johnny:{}'.format(JOHNNY_KEY),
     }
 
-    logging.debug('Config: {}'.format(proxy_config))
 
-    zaza_model.set_application_config("ceph-proxy", proxy_config)
+def setup_ceph_proxy():
+    """Configure ceph-proxy with metadata from the backing Ceph cluster."""
+    proxy_config = _get_proxy_config()
+    logging.info('Configuring ceph-proxy with %s', proxy_config)
+    zaza_model.set_application_config('ceph-proxy', proxy_config)
+
+
+def _get_relation_info(unit_name: str, endpoint: str,
+                       related_endpoint: str = None,
+                       related_application: str = None):
+    cmd = ['juju', 'show-unit', '--format=json', unit_name]
+    output = subprocess.check_output(cmd, text=True)
+    unit_data = json.loads(output)[unit_name]
+
+    for relation_info in unit_data.get('relation-info', []):
+        if relation_info.get('endpoint') != endpoint:
+            continue
+        if (related_endpoint and
+                relation_info.get('related-endpoint') != related_endpoint):
+            continue
+        if related_application:
+            related_units = relation_info.get('related-units', {})
+            if not any(
+                    related_unit.split('/')[0] == related_application
+                    for related_unit in related_units):
+                continue
+        return relation_info
+
+    raise KeyError(
+        'Unable to find relation info for {}:{} -> {}'.format(
+            unit_name, endpoint, related_endpoint))
 
 
 class CephProxyTest(unittest.TestCase):
@@ -112,6 +162,50 @@ class CephProxyTest(unittest.TestCase):
                        ' configured correctly.'
                        ' Found: {}'.format(expected, output))
                 raise zaza_exceptions.CephPoolNotConfigured(msg)
+
+
+class CephProxyUserKeyTests(unittest.TestCase):
+    """Test configured user-keys with a generic ceph client."""
+
+    @tenacity.retry(
+        wait=tenacity.wait_exponential(multiplier=1, min=2, max=10),
+        stop=tenacity.stop_after_attempt(10),
+        reraise=True)
+    def _get_johnny_relation_data(self):
+        relation_info = _get_relation_info(
+            'johnny/0',
+            endpoint='ceph',
+            related_endpoint='client',
+            related_application='ceph-proxy')
+        remote_units = relation_info.get('related-units', {})
+        data = remote_units['ceph-proxy/0']['data']
+        self.assertEqual(JOHNNY_KEY, data.get('key'))
+        self.assertEqual('cephx', data.get('auth'))
+        self.assertTrue(data.get('ceph-public-address'))
+        return data
+
+    def test_user_keys_with_generic_ceph_client(self):
+        """Verify configured user-keys are shared with a ceph-client app."""
+        self._get_johnny_relation_data()
+
+        for attempt in tenacity.Retrying(
+            wait=tenacity.wait_exponential(multiplier=2, max=32),
+            reraise=True, stop=tenacity.stop_after_attempt(8),
+        ):
+            with attempt:
+                pools = zaza_ceph.get_ceph_pools('ceph-mon/0')
+                if 'johnny-metadata' not in pools:
+                    msg = ('johnny-metadata pool not found querying '
+                           'ceph-mon/0, got: {}'.format(pools))
+                    raise zaza_exceptions.CephPoolNotFound(msg)
+
+        result = zaza_model.run_on_unit(
+            'ceph-mon/0',
+            'sudo ceph auth get client.johnny')
+        self.assertNotEqual(0, int(result.get('Code')))
+        self.assertIn(
+            'failed to find client.johnny',
+            result.get('Stderr', ''))
 
 
 class CephFSWithCephProxyTests(unittest.TestCase):
