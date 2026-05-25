@@ -5,6 +5,7 @@ provides:
   nrpe-external-master:
     interface: nrpe-external-master
     scope: container
+    optional: true
 tags:
 - openstack
 - storage
@@ -27,6 +28,7 @@ requires:
     interface: ceph-osd
   secrets-storage:
     interface: vault-kv
+    optional: true
 storage:
   osd-devices:
     type: block
