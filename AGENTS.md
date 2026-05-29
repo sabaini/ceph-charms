@@ -54,7 +54,3 @@ Per-charm, from the repo root. All nine charms expose the same envs:
 tox -c <charm-dir> -e pep8     # lint (flake8)
 tox -c <charm-dir> -e py3      # unit tests (stestr)
 ```
-
-## Integration / functional tests
-
-**Do not run integration, functional, or zaza (`func`, `func-smoke`, `func-dev`, `integration`) targets locally.** They require a bootstrapped Juju controller, LXD, and self-hosted CI runners. They run from `.github/workflows/build-and-test.yml` (`functional-test`, `cos-integration-test`) and via the `terraform-integration` env when explicitly invoked. If a change needs functional coverage, note it and let CI run it.
