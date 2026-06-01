@@ -10,4 +10,9 @@ then
     rm "${charm}.charm"
 fi
 echo "Renaming charm here."
-mv ${charm}_*.charm ${charm}.charm
+if [[ -e "${charm}_amd64.charm" ]]; then
+    mv "${charm}_amd64.charm" "${charm}.charm"
+else
+    latest_charm=$(ls -t ${charm}_*.charm | head -n1)
+    mv "${latest_charm}" "${charm}.charm"
+fi
