@@ -1,14 +1,36 @@
 #!/bin/bash
+set -euo pipefail
+
 charm=$(grep "charm_build_name" osci.yaml | awk '{print $2}')
-echo "renaming ${charm}_*.charm to ${charm}.charm"
+artifacts=("${charm}"_*.charm)
+
+echo "Copying built charm artifacts for ${charm}"
 echo -n "pwd: "
 pwd
 ls -al
-echo "Removing bad downloaded charm maybe?"
-if [[ -e "${charm}.charm" ]];
-then
-    rm "${charm}.charm"
+
+if [[ ${#artifacts[@]} -eq 0 || ! -e "${artifacts[0]}" ]]; then
+    echo "No charm artifacts found for ${charm}" >&2
+    exit 1
 fi
-echo "Renaming charm here."
-mv ${charm}_*.charm ${charm}.charm
-cp ${charm}.charm ../
+
+rm -f "${charm}.charm" "../${charm}.charm"
+cp "${artifacts[@]}" ../
+
+# Keep the historical generic artifact name for tooling that still expects it.
+# A specific platform can be selected with CHARMCRAFT_GENERIC_PLATFORM or
+# TEST_CHARM_PLATFORM (for example: ubuntu-26.04-amd64).  Otherwise prefer the
+# 24.04 build because that matches the pre-multi-platform default.
+generic_platform="${CHARMCRAFT_GENERIC_PLATFORM:-${TEST_CHARM_PLATFORM:-}}"
+default_artifact="${artifacts[0]}"
+if [[ -n "${generic_platform}" ]]; then
+    default_artifact="${charm}_${generic_platform}.charm"
+    if [[ ! -e "${default_artifact}" ]]; then
+        echo "Requested generic artifact ${default_artifact} was not built" >&2
+        exit 1
+    fi
+elif [[ -e "${charm}_ubuntu-24.04-amd64.charm" ]]; then
+    default_artifact="${charm}_ubuntu-24.04-amd64.charm"
+fi
+cp "${default_artifact}" "${charm}.charm"
+cp "${charm}.charm" ../

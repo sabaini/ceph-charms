@@ -12,8 +12,13 @@ machines:
     constraints: cores=2 mem=6G root-disk=24G virt-type=virtual-machine
   '6':
     base: ubuntu@22.04
-    constraints: root-disk=12G virt-type=virtual-machine
+    constraints: cores=4 mem=8G root-disk=32G virt-type=virtual-machine
   '7':
+    base: ubuntu@24.04
+  '8':
+    base: ubuntu@24.04
+  '9':
+    base: ubuntu@24.04
 
 applications:
   ceph-mon:
@@ -22,6 +27,7 @@ applications:
     num_units: 3
     options:
       monitor-count: 3
+      source: distro
     to:
       - '0'
       - '1'
@@ -31,6 +37,8 @@ applications:
     charm: ch:ceph-osd
     num_units: 3
     channel: tentacle/edge
+    options:
+      source: distro
     storage:
       osd-devices: 'loop,8G'
     to:
@@ -49,24 +57,27 @@ applications:
   rabbitmq-server:
     charm: ch:rabbitmq-server
     channel: latest/edge
+    base: ubuntu@24.04
     num_units: 1
     options:
       min-cluster-size: 1
     to:
-      - '0'
+      - '9'
 
   cinder:
     charm: ch:cinder
     channel: latest/edge
+    base: ubuntu@24.04
     num_units: 1
     options:
       block-device: 'None'
     to:
-      - '2'
+      - '8'
 
   keystone:
     charm: ch:keystone
     channel: latest/edge
+    base: ubuntu@24.04
     num_units: 1
     to:
       - '7'

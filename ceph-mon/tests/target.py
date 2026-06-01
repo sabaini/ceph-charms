@@ -208,9 +208,8 @@ class CephTest(test_utils.BaseCharmTest):
         Verify that the new disk is added with encryption by checking for
         Ceph's encryption keys directory.
         """
-        current_release = zaza_openstack.get_os_release(application='ceph-mon')
-        trusty_mitaka = zaza_openstack.get_os_release('trusty_mitaka')
-        if current_release >= trusty_mitaka:
+        if test_utils.package_version_matches(
+                'ceph-mon', 'ceph-common', ['10.2.0'], 'ge'):
             logging.warn("Skipping encryption test for Mitaka and higher")
             return
         unit_name = 'ceph-osd/0'
@@ -292,9 +291,8 @@ class CephTest(test_utils.BaseCharmTest):
         As the ephemeral device will have data on it we can use it to validate
         that these checks work as intended.
         """
-        current_release = zaza_openstack.get_os_release(application='ceph-mon')
-        focal_ussuri = zaza_openstack.get_os_release('focal_ussuri')
-        if current_release >= focal_ussuri:
+        if test_utils.package_version_matches(
+                'ceph-mon', 'ceph-common', ['15.2.0'], 'ge'):
             # NOTE(ajkavanagh) - focal (on ServerStack) is broken for /dev/vdb
             # and so this test can't pass: LP#1842751 discusses the issue, but
             # basically the snapd daemon along with lxcfs results in /dev/vdb
@@ -305,6 +303,7 @@ class CephTest(test_utils.BaseCharmTest):
             # /dev/vdb ephemeral
             logging.warn("Skipping pristine disk test for focal and higher")
             return
+        current_release = zaza_openstack.get_os_release(application='ceph-mon')
         logging.info('Checking behaviour when non-pristine disks appear...')
         logging.info('Configuring ephemeral-unmount...')
         alternate_conf = {
