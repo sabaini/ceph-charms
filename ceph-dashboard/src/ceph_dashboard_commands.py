@@ -70,7 +70,8 @@ def ceph_dashboard_config_saml(
     _run_cmd(cmd)
 
 
-def ceph_config_get(key: str, event=None, detail=None, description=None) -> str:
+def ceph_config_get(key: str, event=None, detail=None,
+                    description=None) -> str:
     "Fetch Value for a particular ceph-config key."
     cmd = [
         "ceph", "config-key", "get", key
