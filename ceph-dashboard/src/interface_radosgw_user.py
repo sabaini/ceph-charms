@@ -16,6 +16,8 @@
 
 import json
 
+import charms_ceph.selog as selog
+
 from ops.framework import (
     StoredState,
     EventBase,
@@ -55,6 +57,9 @@ class RadosGWUserRequires(Object):
                     self.request_system_role)
 
     def get_user_creds(self):
+        selog.log('Get user credentials for RadosGW',
+                  event='authn_rgw_user_creds',
+                  detail='rgw_user_creds_fetch')
         creds = []
         for relation in self.framework.model.relations[self.relation_name]:
             app_data = relation.data[relation.app]

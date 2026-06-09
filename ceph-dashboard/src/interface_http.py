@@ -3,6 +3,8 @@
 import logging
 from typing import Dict, Union
 
+import charms_ceph.selog as selog
+
 from ops.charm import RelationChangedEvent
 from ops.model import Relation
 
@@ -52,6 +54,9 @@ class HTTPRequires(Object):
 
         Return endpoint data for accessing the remote service. If the relation
         or required keys are missing then return None"""
+        selog.log('Get data endpoint for remote service',
+                  event='authz_service_endpoint',
+                  detail='service_endpoint_fetch')
         logging.debug("http on_changed")
         if self.http_relation:
             for u in self.http_relation.units:

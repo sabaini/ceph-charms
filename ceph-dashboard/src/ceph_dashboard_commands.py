@@ -15,6 +15,7 @@ from functools import partial
 import subprocess
 import logging
 
+import charms_ceph.selog as selog
 import charms_ceph.utils as ceph_utils
 from charm_option import CharmCephOption
 
@@ -69,11 +70,12 @@ def ceph_dashboard_config_saml(
     _run_cmd(cmd)
 
 
-def ceph_config_get(key: str) -> str:
+def ceph_config_get(key: str, event=None, detail=None, description=None) -> str:
     "Fetch Value for a particular ceph-config key."
     cmd = [
         "ceph", "config-key", "get", key
     ]
+    selog.log(description, event=event, detail=detail)
     try:
         return _run_cmd(cmd)
     except subprocess.CalledProcessError:
@@ -119,13 +121,28 @@ def apply_setting(ceph_setting: str, value: List[str]) -> str:
     return _run_cmd(cmd)
 
 
-get_ceph_dashboard_ssl_key = partial(ceph_config_get, "mgr/dashboard/key")
-get_ceph_dashboard_ssl_crt = partial(ceph_config_get, "mgr/dashboard/crt")
+get_ceph_dashboard_ssl_key = partial(ceph_config_get, "mgr/dashboard/key",
+                                     event='authn_ssl_key',
+                                     detail='dashboard_ssl_key_fetch',
+                                     description='Getting dashboard SSL key')
+
+get_ceph_dashboard_ssl_crt = partial(ceph_config_get, "mgr/dashboard/crt",
+                                     event='authn_ssl_crt',
+                                     detail='dashboard_ssl_crt_fetch',
+                                     description='Getting dashboard SSL cert')
+
 get_ceph_dashboard_host_ssl_key = partial(
-    ceph_config_get, f"mgr/dashboard/{socket.gethostname()}/key"
+    ceph_config_get, f"mgr/dashboard/{socket.gethostname()}/key",
+    event='authn_host_ssl_key',
+    detail='host_ssl_key_fetch',
+    description='Getting host SSL key'
 )
+
 get_ceph_dashboard_host_ssl_crt = partial(
-    ceph_config_get, f"mgr/dashboard/{socket.gethostname()}/crt"
+    ceph_config_get, f"mgr/dashboard/{socket.gethostname()}/crt",
+    event='authn_host_ssl_crt',
+    detail='host_ssl_crt_fetch',
+    description='Getting host SSL cert'
 )
 
 
@@ -150,7 +167,9 @@ def check_ceph_dashboard_ssl_configured(
         ]
 
     for key in keys:
-        value = ceph_config_get(key)
+        value = ceph_config_get(key, event='authn_ssl_config',
+                                detail='ssl_config_verify',
+                                description='Checking SSL configuration')
         if value is None:
             return False
 
@@ -166,6 +185,10 @@ def validate_ssl_keypair(cert: bytes, key: bytes) -> Tuple[bool, str]:
     Returns:
         Tuple[bool, str]: bool for validaity and err message
     """
+
+    selog.log('Validate private key against a certificate',
+              event='authz_validate_ssl_pair',
+              detail='validate_ssl_pair')
     try:
         with tempfile.NamedTemporaryFile(mode="wb", delete=False) as cert_temp:
             cert_temp.write(cert)
@@ -251,6 +274,9 @@ def ceph_mgr_instances() -> list:
 
 
 def set_ssl_material(key_path, cert_path) -> None:
+    selog.log('Storing SSL material',
+              event='authz_set_ssl',
+              detail='ssl_material_set')
     for instance in ceph_mgr_instances():
         logging.debug(f"Setting SSL material for {instance}")
         ceph_utils.dashboard_set_ssl_certificate(

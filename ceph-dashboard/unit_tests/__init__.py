@@ -15,6 +15,8 @@
 import sys
 import unittest.mock as mock
 
+import charms_ceph.selog as selog
+
 # Mock out secrets to make py35 happy.
 sys.modules['secrets'] = mock.MagicMock()
 
@@ -22,3 +24,6 @@ sys.modules['secrets'] = mock.MagicMock()
 tenacity = mock.MagicMock()
 tenacity.retry.side_effect = lambda *args, **kwargs: lambda x: x
 sys.modules['tenacity'] = tenacity
+
+# Set log defaults.
+selog.register_defaults({'appid': 'ceph.dashboard'})
