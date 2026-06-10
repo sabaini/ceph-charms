@@ -23,12 +23,16 @@ requires:
     scope: container
   certificates:
     interface: tls-certificates
+    optional: true
   loadbalancer:
     interface: openstack-loadbalancer
+    optional: true
   alertmanager-service:
     interface: http
+    optional: true
   prometheus:
     interface: http
+    optional: true
   radosgw-dashboard:
     interface: radosgw-user
   iscsi-dashboard:
