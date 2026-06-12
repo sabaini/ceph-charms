@@ -13,6 +13,10 @@ machines:
   '3':
   '4':
   '5':
+  '6':
+    constraints: cores=1 mem=2G root-disk=12G virt-type=virtual-machine
+  '7':
+    constraints: cores=1 mem=2G root-disk=12G virt-type=virtual-machine
 
 applications:
   ceph-fs:
@@ -52,6 +56,14 @@ applications:
       - '3'
       - '4'
       - '5'
+
+  ubuntu:
+    charm: ch:ubuntu
+    num_units: 2
+    channel: latest/stable
+    to:
+      - '6'
+      - '7'
 
 relations:
   - - 'ceph-mon:mds'

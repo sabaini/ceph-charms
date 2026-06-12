@@ -3,9 +3,25 @@ type: charm
 parts:
   charm:
     after: [git-info]
-    plugin: reactive
-    reactive-charm-build-arguments:
-      - --binary-wheels-from-source
+    plugin: nil
+    override-build: |
+      craftctl default
+      charm_tool_run() {
+        set +e
+        "$@"
+        rc=$?
+        set -e
+        if [ ${rc} -ge 100 ] && [ ${rc} -lt 200 ]; then
+          return 0
+        fi
+        return ${rc}
+      }
+      charm_tool_run charm proof
+      charm_build_dir="${CRAFT_PART_BUILD}/${CRAFT_PROJECT_NAME}"
+      rm -rf "${charm_build_dir}"
+      ln -s "${CRAFT_PART_INSTALL}" "${charm_build_dir}"
+      charm_tool_run charm build --binary-wheels-from-source -o "${CRAFT_PART_BUILD}"
+      rm "${charm_build_dir}"
     build-packages:
       - tox
       - git
@@ -29,18 +45,19 @@ parts:
         echo "commit_date: $(git -C $CRAFT_PROJECT_DIR show -s --format=%cI HEAD)" >> $CRAFT_PART_INSTALL/git-info.txt
       fi
 
-base: ubuntu@24.04
-build-base: ubuntu@24.04
 platforms:
-  amd64:
-    build-on: amd64
-    build-for: amd64
-  arm64:
-    build-on: arm64
-    build-for: arm64
-  s390x:
-    build-on: s390x
-    build-for: s390x
-  ppc64el:
-    build-on: ppc64el
-    build-for: ppc64el
+  ubuntu-26.04-amd64:
+    build-on: [ubuntu@26.04:amd64]
+    build-for: [ubuntu@26.04:amd64]
+  ubuntu-24.04-amd64:
+    build-on: [ubuntu@24.04:amd64]
+    build-for: [ubuntu@24.04:amd64]
+  ubuntu-24.04-arm64:
+    build-on: [ubuntu@24.04:arm64]
+    build-for: [ubuntu@24.04:arm64]
+  ubuntu-24.04-s390x:
+    build-on: [ubuntu@24.04:s390x]
+    build-for: [ubuntu@24.04:s390x]
+  ubuntu-24.04-ppc64el:
+    build-on: [ubuntu@24.04:ppc64el]
+    build-for: [ubuntu@24.04:ppc64el]

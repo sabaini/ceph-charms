@@ -29,7 +29,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "charmhelpers", git = "https://github.com/juju/charm-helpers" },
-    { name = "charms-ceph", git = "https://github.com/openstack/charms.ceph" },
+    { name = "charms-ceph", git = "https://github.com/canonical/ceph-charms.git?subdirectory=charms.ceph" },
     { name = "cosl" },
     { name = "dnspython" },
     { name = "importlib-resources" },
@@ -49,8 +49,8 @@ requires-dist = [
 
 [[package]]
 name = "charmhelpers"
-version = "1.1.1.dev151"
-source = { git = "https://github.com/juju/charm-helpers#5488b35a8d271ab2666111784121d4f65e1eca2e" }
+version = "1.1.1.dev153"
+source = { git = "https://github.com/juju/charm-helpers#99980625aa2ad176dfb7e54dd53d2a13acbacc02" }
 dependencies = [
     { name = "jinja2" },
     { name = "looseversion" },
@@ -62,7 +62,7 @@ dependencies = [
 [[package]]
 name = "charms-ceph"
 version = "0.0.1.dev1"
-source = { git = "https://github.com/openstack/charms.ceph#1a66fb4a0154b2f9b0e2fdff76d18bb7302194cc" }
+source = { git = "https://github.com/canonical/ceph-charms.git?subdirectory=charms.ceph#0c5e35706e43972cba82eeb09fcfd57e72f80336" }
 dependencies = [
     { name = "charmhelpers" },
     { name = "pyudev" },

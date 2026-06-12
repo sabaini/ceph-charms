@@ -4,7 +4,7 @@ gate_bundles:
 smoke_bundles:
   - noble-caracal
 dev_bundles:
-  - noble-caracal
+  - resolute-tentacle
 configure:
   - zaza.openstack.charm_tests.vault.setup.auto_initialize_no_validation
   - tests.target.check_dashboard_cert

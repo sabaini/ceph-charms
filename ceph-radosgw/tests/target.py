@@ -1120,20 +1120,6 @@ class S3APITest(test_utils.OpenStackBaseTest):
         """Run class setup for running tests."""
         super(S3APITest, cls).setUpClass()
 
-        # CharmRefreshAll may have just refreshed ceph-radosgw/ceph-mon/
-        # ceph-osd.  Wait for any post-refresh package upgrades and service
-        # restarts to settle before exercising the S3 endpoint.
-        zaza_model.block_until_all_units_idle(timeout=900)
-        zaza_model.block_until_unit_wl_status('ceph-radosgw/0', 'active')
-
-        if (test_utils.package_version_matches(
-                'ceph-radosgw', 'radosgw', ['20.2.0'], 'ge') and
-                test_utils.package_version_matches(
-                    'ceph-radosgw', 'radosgw', ['20.2.1'], 'lt')):
-            raise unittest.SkipTest(
-                'radosgw 20.2.0 segfaults in RGWHTTPManager when Keystone '
-                'S3 authentication is exercised')
-
         session = openstack_utils.get_overcloud_keystone_session()
         ks_client = openstack_utils.get_keystone_session_client(session)
 

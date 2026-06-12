@@ -16,6 +16,7 @@ import ipaddress
 import logging
 import os
 from pathlib import Path
+import platform
 import socket
 import subprocess
 import tempfile
@@ -99,6 +100,16 @@ class CephNFSContext(object):
     @property
     def hostname(self):
         return socket.gethostname()
+
+    @property
+    def allow_set_io_flusher_fail(self):
+        """Allow nfs-ganesha to run in unprivileged containers on 26.04.
+
+        NFS-Ganesha 6.5 on Ubuntu 26.04 exits if PR_SET_IO_FLUSHER is
+        denied. Older supported releases do not understand this option.
+        """
+        return platform.freedesktop_os_release().get(
+            'VERSION_CODENAME') == 'resolute'
 
 
 class OpenStackContextAdapters(

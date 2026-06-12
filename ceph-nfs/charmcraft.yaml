@@ -4,8 +4,30 @@ parts:
   charm:
     after:
       - update-certificates
+    plugin: uv
+    source: .
+    build-snaps:
+      - astral-uv
     build-packages:
       - git
+      - gcc
+      - python3-dev
+    override-build: |
+      craftctl default
+      for path in actions files templates; do
+        if [ -e "$CRAFT_PART_BUILD/${path}" ]; then
+          cp --archive --recursive --reflink=auto \
+            "$CRAFT_PART_BUILD/${path}" \
+            "$CRAFT_PART_INSTALL/"
+        fi
+      done
+      for path in hardening.yaml icon.svg; do
+        if [ -e "$CRAFT_PART_BUILD/${path}" ]; then
+          cp --archive --reflink=auto \
+            "$CRAFT_PART_BUILD/${path}" \
+            "$CRAFT_PART_INSTALL/"
+        fi
+      done
 
   update-certificates:
     after: [git-info]
@@ -28,18 +50,19 @@ parts:
       fi
 
 
-base: ubuntu@24.04
-build-base: ubuntu@24.04
 platforms:
-  amd64:
-    build-on: amd64
-    build-for: amd64
-  arm64:
-    build-on: arm64
-    build-for: arm64
-  s390x:
-    build-on: s390x
-    build-for: s390x
-  ppc64el:
-    build-on: ppc64el
-    build-for: ppc64el
+  ubuntu-26.04-amd64:
+    build-on: [ubuntu@26.04:amd64]
+    build-for: [ubuntu@26.04:amd64]
+  ubuntu-24.04-amd64:
+    build-on: [ubuntu@24.04:amd64]
+    build-for: [ubuntu@24.04:amd64]
+  ubuntu-24.04-arm64:
+    build-on: [ubuntu@24.04:arm64]
+    build-for: [ubuntu@24.04:arm64]
+  ubuntu-24.04-s390x:
+    build-on: [ubuntu@24.04:s390x]
+    build-for: [ubuntu@24.04:s390x]
+  ubuntu-24.04-ppc64el:
+    build-on: [ubuntu@24.04:ppc64el]
+    build-for: [ubuntu@24.04:ppc64el]

@@ -78,7 +78,7 @@ class TestHTTPRequires(unittest.TestCase):
             'prometheus/0',
             {
                 'hostname': 'promhost',
-                'port': 3000})
+                'port': '3000'})
         self.assertEqual(
             self.harness.charm.seen_events,
             ['HTTPEvent'])
@@ -91,7 +91,7 @@ class TestHTTPRequires(unittest.TestCase):
             'prometheus/0',
             {
                 'hostname': 'promhost',
-                'port': 3000})
+                'port': '3000'})
         self.assertEqual(
             self.harness.charm.prometheus.get_service_ep_data(),
-            {'hostname': 'promhost', 'port': 3000})
+            {'hostname': 'promhost', 'port': '3000'})

@@ -12,6 +12,17 @@ parts:
     - git
     - gcc
     - python3-dev
+    override-build: |
+      craftctl default
+      cp --archive --recursive --reflink=auto \
+        "$CRAFT_PART_BUILD/actions" \
+        "$CRAFT_PART_BUILD/files" \
+        "$CRAFT_PART_BUILD/templates" \
+        "$CRAFT_PART_INSTALL/"
+      cp --archive --reflink=auto \
+        "$CRAFT_PART_BUILD/hardening.yaml" \
+        "$CRAFT_PART_BUILD/icon.svg" \
+        "$CRAFT_PART_INSTALL/"
 
   update-certificates:
     # Ensure that certificates in the base image are up-to-date.

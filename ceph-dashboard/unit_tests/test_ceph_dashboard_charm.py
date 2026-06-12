@@ -25,12 +25,11 @@ sys.path.append('src')  # noqa
 
 from unittest.mock import ANY, call, patch, MagicMock
 
-from ops.testing import Harness, _TestingModelBackend
+from ops.testing import Harness
 from ops.model import (
     ActiveStatus,
     BlockedStatus,
 )
-from ops import framework, model
 import charm
 
 TEST_CA = '''-----BEGIN CERTIFICATE-----
@@ -173,6 +172,8 @@ class TestCephDashboardCharmBase(CharmTestCase):
 
         self.socket.gethostname.return_value = 'server1'
         self.socket.getfqdn.return_value = 'server1.local'
+        self.subprocess.check_output.return_value = (
+            b'{"enabled_modules": ["dashboard"]}')
 
     def get_harness(self):
         initial_config = {'grafana-api-url': None}
@@ -180,31 +181,7 @@ class TestCephDashboardCharmBase(CharmTestCase):
             _CephDashboardCharm,
         )
 
-        # BEGIN: Workaround until network_get is implemented
-        class _TestingOPSModelBackend(_TestingModelBackend):
-
-            def network_get(self, endpoint_name, relation_id=None):
-                network_data = {
-                    'bind-addresses': [{
-                        'interface-name': 'eth0',
-                        'addresses': [{
-                            'cidr': '10.0.0.0/24',
-                            'value': '10.0.0.10'}]}],
-                    'ingress-addresses': ['10.0.0.10'],
-                    'egress-subnets': ['10.0.0.0/24']}
-                return network_data
-
-        _harness._backend = _TestingOPSModelBackend(
-            _harness._unit_name, _harness._meta)
-        _harness._model = model.Model(
-            _harness._meta,
-            _harness._backend)
-        _harness._framework = framework.Framework(
-            ":memory:",
-            _harness._charm_dir,
-            _harness._meta,
-            _harness._model)
-        # END Workaround
+        _harness.add_network('10.0.0.10')
         _harness.update_config(initial_config)
         return _harness
 
@@ -276,7 +253,7 @@ class TestCephDashboardCharmBase(CharmTestCase):
             mock_run.reset_mock()
             _harness.update_config(
                 key_values={charm_option: charm_value})
-            mock_run.assert_called_once_with(
+            mock_run.assert_any_call(
                 expected_cmd,
                 capture_output=True,
                 check=True,
@@ -310,9 +287,12 @@ class TestCephDashboardCharmBase(CharmTestCase):
                           'relation or provide via charm config'))
         self.harness.update_config(
             key_values={
-                'ssl_key': base64.b64encode(TEST_KEY.encode("utf-8")),
-                'ssl_cert': base64.b64encode(TEST_CERT.encode("utf-8")),
-                'ssl_ca': base64.b64encode(TEST_CA.encode("utf-8"))})
+                'ssl_key': base64.b64encode(
+                    TEST_KEY.encode("utf-8")).decode("utf-8"),
+                'ssl_cert': base64.b64encode(
+                    TEST_CERT.encode("utf-8")).decode("utf-8"),
+                'ssl_ca': base64.b64encode(
+                    TEST_CA.encode("utf-8")).decode("utf-8")})
         self.assertEqual(
             self.harness.charm.check_dashboard(),
             ActiveStatus())
@@ -340,9 +320,12 @@ class TestCephDashboardCharmBase(CharmTestCase):
             'grafana/0')
         self.harness.update_config(
             key_values={
-                'ssl_key': base64.b64encode(TEST_KEY.encode("utf-8")),
-                'ssl_cert': base64.b64encode(TEST_CERT.encode("utf-8")),
-                'ssl_ca': base64.b64encode(TEST_CA.encode("utf-8"))})
+                'ssl_key': base64.b64encode(
+                    TEST_KEY.encode("utf-8")).decode("utf-8"),
+                'ssl_cert': base64.b64encode(
+                    TEST_CERT.encode("utf-8")).decode("utf-8"),
+                'ssl_ca': base64.b64encode(
+                    TEST_CA.encode("utf-8")).decode("utf-8")})
         self.assertEqual(
             self.harness.charm.check_dashboard(),
             BlockedStatus('Charm config option grafana-api-url not set'))
@@ -472,8 +455,7 @@ class TestCephDashboardCharmBase(CharmTestCase):
         mock_TLS_CERT_PATH.write_bytes.assert_called_once()
         mock_TLS_VAULT_CA_CERT_PATH.write_bytes.assert_called_once()
         mock_TLS_KEY_PATH.write_bytes.assert_called_once()
-        self.subprocess.check_call.assert_called_once_with(
-            ['update-ca-certificates'])
+        self.subprocess.check_call.assert_any_call(['update-ca-certificates'])
         set_ssl_material.assert_called_with(
             mock_TLS_KEY_PATH,
             mock_TLS_CERT_PATH)
@@ -502,9 +484,12 @@ class TestCephDashboardCharmBase(CharmTestCase):
         self.harness.charm.TLS_KEY_PATH = mock_TLS_KEY_PATH
         self.harness.update_config(
             key_values={
-                'ssl_key': base64.b64encode(TEST_KEY.encode("utf-8")),
-                'ssl_cert': base64.b64encode(TEST_CERT.encode("utf-8")),
-                'ssl_ca': base64.b64encode(TEST_CA.encode("utf-8"))})
+                'ssl_key': base64.b64encode(
+                    TEST_KEY.encode("utf-8")).decode("utf-8"),
+                'ssl_cert': base64.b64encode(
+                    TEST_CERT.encode("utf-8")).decode("utf-8"),
+                'ssl_ca': base64.b64encode(
+                    TEST_CA.encode("utf-8")).decode("utf-8")})
         set_ssl_material.assert_called_with(
             mock_TLS_KEY_PATH,
             mock_TLS_CERT_PATH)

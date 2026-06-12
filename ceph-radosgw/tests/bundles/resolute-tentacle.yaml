@@ -18,7 +18,7 @@ machines:
    '6':
    '7':
      base: ubuntu@22.04
-     constraints: cores=4 mem=8G root-disk=32G virt-type=virtual-machine
+     constraints: cores=2 mem=4G root-disk=16G virt-type=virtual-machine
    '8':
      base: ubuntu@24.04
    '9':

@@ -7,7 +7,12 @@ smoke_bundles:
   - noble-caracal
 
 dev_bundles:
-  - noble-caracal
+  - resolute-tentacle
+
+target_deploy_status:
+  ubuntu:
+    workload-status: active
+    workload-status-message-prefix: ''
 
 tests:
   - zaza.charm_tests.lifecycle.refresh.CharmRefreshAll

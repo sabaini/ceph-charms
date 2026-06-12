@@ -7,7 +7,7 @@ smoke_bundles:
   - noble-caracal
 
 dev_bundles:
-  - noble-caracal
+  - resolute-tentacle
 
 configure:
   - tests.target.setup_ceph_proxy

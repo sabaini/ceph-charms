@@ -33,11 +33,12 @@ class CephFSTests(unittest.TestCase):
     mounts_share = False
     mount_dir = '/mnt/cephfs'
     CEPH_MON = 'ceph-mon'
+    CLIENT_UNITS = ('ubuntu/0', 'ubuntu/1')
 
     def tearDown(self):
         """Cleanup after running tests."""
         if self.mounts_share:
-            for unit in ['ceph-osd/0', 'ceph-osd/1']:
+            for unit in self.CLIENT_UNITS:
                 try:
                     zaza.utilities.generic.run_via_ssh(
                         unit_name=unit,
@@ -123,11 +124,11 @@ class CephFSTests(unittest.TestCase):
         4. read it on the other
         5. profit
         """
-        self._mount_share('ceph-osd/0')
-        self._mount_share('ceph-osd/1')
+        self._mount_share(self.CLIENT_UNITS[0])
+        self._mount_share(self.CLIENT_UNITS[1])
 
-        self._write_testing_file_on_instance('ceph-osd/0')
-        self._verify_testing_file_on_instance('ceph-osd/1')
+        self._write_testing_file_on_instance(self.CLIENT_UNITS[0])
+        self._verify_testing_file_on_instance(self.CLIENT_UNITS[1])
 
     def test_conf(self):
         """Test ceph to ensure juju config options are properly set."""

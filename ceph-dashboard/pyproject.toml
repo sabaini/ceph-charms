@@ -1,0 +1,18 @@
+[project]
+name = "ceph-dashboard"
+version = "0.0.1"
+requires-python = ">=3.10"
+dependencies = [
+    "cryptography",
+    "importlib-resources",
+    "netifaces>=0.11.0",
+    "ops>=1.2.0",
+    "psutil",
+    "tenacity",
+    "setuptools",
+    "charms-ceph @ git+https://github.com/canonical/ceph-charms.git#subdirectory=charms.ceph",
+    "ops-openstack @ git+https://opendev.org/openstack/charm-ops-openstack",
+    "interface-tls-certificates @ git+https://opendev.org/openstack/charm-ops-interface-tls-certificates",
+    "interface-ceph-iscsi-admin-access @ git+https://github.com/openstack-charmers/ops-interface-ceph-iscsi-admin-access",
+    "interface-openstack-loadbalancer @ git+https://github.com/openstack-charmers/ops-interface-openstack-loadbalancer",
+]

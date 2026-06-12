@@ -315,6 +315,12 @@ class CephDashboardTest(test_utils.BaseCharmTest):
 
     def test_005_saml(self):
         """Check that the dashboard is accessible with SAML enabled."""
+        sso_status = zaza.model.run_on_leader(
+            'ceph-mon', 'ceph dashboard sso status')
+        if (sso_status.get('Code') != '0' and
+                'python3-saml' in sso_status.get('Stderr', '')):
+            self.skipTest('Ceph dashboard SAML support unavailable')
+
         url = self.get_master_dashboard_url()
         idp_meta = SAML_IDP_METADATA.format(
             cert=X509_CERT,
