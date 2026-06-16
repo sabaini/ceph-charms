@@ -754,8 +754,6 @@ def _is_int(v):
 
 def get_version():
     """Derive Ceph release from an installed package."""
-    import apt_pkg as apt
-
     package = "ceph"
 
     current_ver = get_installed_version(package)
@@ -763,6 +761,14 @@ def get_version():
         # package is known, but no version is currently installed.
         e = 'Could not determine version of uninstalled package: %s' % package
         error_out(e)
+
+    try:
+        import apt_pkg as apt
+    except ImportError:
+        # apt_pkg is not importable from the isolated charm virtualenv on
+        # newer bases. Use charmhelpers' python implementation instead of
+        # vendoring the python3-apt binary extension into the charm venv.
+        from charmhelpers.fetch import ubuntu_apt_pkg as apt
 
     vers = apt.upstream_version(current_ver.ver_str)
 
@@ -3198,6 +3204,7 @@ UPGRADE_PATHS = collections.OrderedDict([
     ('pacific', 'quincy'),
     ('quincy', 'reef'),
     ('reef', 'squid'),
+    ('squid', 'tentacle'),
 ])
 
 # Map UCA codenames to Ceph codenames
