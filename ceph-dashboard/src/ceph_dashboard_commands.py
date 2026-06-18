@@ -76,6 +76,7 @@ def ceph_config_get(key: str, event=None, detail=None,
     cmd = [
         "ceph", "config-key", "get", key
     ]
+    assert event is not None
     selog.log(description, event=event, detail=detail)
     try:
         return _run_cmd(cmd)
@@ -149,7 +150,10 @@ get_ceph_dashboard_host_ssl_crt = partial(
 
 def check_ceph_dashboard_ssl_enabled() -> bool:
     """Check if ssl config-key is set to true"""
-    ssl_status = ceph_config_get("config/mgr/mgr/dashboard/ssl")
+    ssl_status = ceph_config_get("config/mgr/mgr/dashboard/ssl",
+                                 event='authn_ssl',
+                                 detail='dashboard_ssl_check',
+                                 description='Check if SSL is enabled')
     return ssl_status == "true"
 
 
