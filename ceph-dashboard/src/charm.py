@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Tuple, Union
 
+import charms_ceph.selog as selog
 import charms_ceph.utils as ceph_utils
 import cryptography.hazmat.primitives.serialization as serialization
 import interface_ceph_iscsi_admin_access.admin_access as admin_access
@@ -85,6 +86,8 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
     def __init__(self, *args) -> None:
         """Setup adapters and observers."""
         super().__init__(*args)
+        selog.register_log_callback(lambda msg: logger.warn(msg))
+        selog.register_defaults({'appid': 'ceph.dashboard'})
         super().register_status_check(self.check_dashboard)
         self.framework.observe(
             self.on.config_changed, self._configure_dashboard
@@ -210,6 +213,9 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
 
     def _request_certificates(self, event) -> None:
         """Request TLS certificates."""
+        selog.log('Get dashboard certificates',
+                  event='authn_dashboard_certificates',
+                  detail='certificates_fetch')
         if not self.ca_client.is_joined:
             logging.debug("Cannot request certificates, relation not present.")
             return
@@ -239,6 +245,9 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
     def _check_for_certs(self) -> bool:
         """Check that charm has TLS data it needs"""
         # Check charm config for TLS data
+        selog.log('Verify TLS data',
+                  event='authn_tls_data',
+                  detail='tls_data_verify')
         key, cert, _ = self._get_tls_from_config()
         if key and cert:
             return True
@@ -422,6 +431,9 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
     def _clean_ssl_conf(self, _event) -> None:
         """Clean ssl conf for ceph-dashboard."""
 
+        selog.log('Clean SSL configuration',
+                  event='authz_ssl_config',
+                  detail='ssl_config_clear')
         # NOTE: Clearing up of SSL key/cert is done centrally so that it can
         # be performed with consistency for all units at once.
         if self.unit.is_leader():
@@ -438,6 +450,9 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
 
         :returns: None if ssl is not configured or provided key/cert are empty.
         """
+        selog.log('Check that SSL key and certificate matches configuration',
+                  event='authn_ssl_key_cert_same',
+                  detail='ssl_key_cert_match')
         if not cmds.check_ceph_dashboard_ssl_configured():
             # Ceph Dashboard SSL not configured.
             return None
@@ -469,6 +484,9 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
 
     def _get_tls_from_config(self) -> TLS_Config:
         """Extract TLS config from charm config."""
+        selog.log('Get TLS configuration from charm',
+                  event='authn_tls_config',
+                  detail='tls_config_get')
         raw_key = self.config.get("ssl_key")
         raw_cert = self.config.get("ssl_cert")
         raw_ca_cert = self.config.get("ssl_ca")
@@ -491,6 +509,9 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
 
     def _get_tls_from_relation(self) -> TLS_Config:
         """Extract TLS config from certificates relation."""
+        selog.log('Get TLS configuration from relation',
+                  event='authn_tls_config',
+                  detail='tls_relation_get')
         # If 'certificates' relation is not present return None.
         if not self._is_relation_active('certificates'):
             return None, None, None
@@ -559,6 +580,9 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
 
     def _configure_tls(self, key, cert, ca_cert, ca_cert_path) -> None:
         """Configure TLS using provided credentials"""
+        selog.log('Configure TLS from provided credentials',
+                  event='authz_tls_config',
+                  detail='tls_config_set')
         is_valid, msg = cmds.validate_ssl_keypair(cert, key)
         if not is_valid:
             logging.error("Invalid SSL key/cert: %s", msg)
@@ -581,6 +605,9 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
         self.kick_dashboard()
 
     def _configure_saml(self) -> None:
+        selog.log('Configure SAML from charm configuration',
+                  event='authz_saml_config',
+                  detail='saml_config_set')
         if not self.unit.is_leader():
             logger.debug("Unit not leader, skipping saml config")
             return
