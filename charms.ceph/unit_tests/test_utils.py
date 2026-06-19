@@ -2100,6 +2100,32 @@ class CephManagerAndConfig(unittest.TestCase):
             ['ceph', 'mgr', 'module', 'ls', '--format=json'])
 
     @patch.object(utils, 'cmp_pkgrevno')
+    @patch.object(utils.subprocess, 'call')
+    @patch.object(utils.subprocess, 'check_output')
+    def test_enabled_manager_modules_dpkg_fallback(
+            self, _check_output, _call, _cmp_pkgrevno):
+        _cmp_pkgrevno.side_effect = AttributeError(
+            "'NoneType' object has no attribute 'ver_str'")
+        _check_output.side_effect = [
+            '20.2.0-0ubuntu2',
+            self.MODULE_OUT,
+        ]
+        _call.side_effect = [1, 0]
+        utils.enabled_manager_modules()
+        _check_output.assert_has_calls([
+            call(
+                ['dpkg-query', '-W', '-f=${Version}', 'ceph-common'],
+                universal_newlines=True),
+            call(['ceph', 'mgr', 'module', 'ls', '--format=json']),
+        ])
+        _call.assert_has_calls([
+            call(['dpkg', '--compare-versions', '20.2.0-0ubuntu2',
+                  'eq', '17.1.0']),
+            call(['dpkg', '--compare-versions', '20.2.0-0ubuntu2',
+                  'gt', '17.1.0']),
+        ])
+
+    @patch.object(utils, 'cmp_pkgrevno')
     @patch.object(utils.subprocess, 'check_output')
     def test_enabled_manager_modules(self, _check_output, _cmp_pkgrevno):
         _cmp_pkgrevno.return_value = -1
