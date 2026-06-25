@@ -2,8 +2,31 @@ type: charm
 parts:
   charm:
     after: ["git-info"]
-    plugin: charm
+    plugin: uv
     source: .
+    build-snaps:
+      - astral-uv
+    build-packages:
+      - git
+      - gcc
+      - python3-dev
+    override-build: |
+      craftctl default
+      for path in actions files templates; do
+        if [ -e "$CRAFT_PART_BUILD/${path}" ]; then
+          cp --archive --recursive --reflink=auto \
+            "$CRAFT_PART_BUILD/${path}" \
+            "$CRAFT_PART_INSTALL/"
+        fi
+      done
+      for path in hardening.yaml icon.svg; do
+        if [ -e "$CRAFT_PART_BUILD/${path}" ]; then
+          cp --archive --reflink=auto \
+            "$CRAFT_PART_BUILD/${path}" \
+            "$CRAFT_PART_INSTALL/"
+        fi
+      done
+
   spdk:
     plugin: dump
     source: .
@@ -40,8 +63,10 @@ parts:
         echo "commit_date: $(git -C $CRAFT_PROJECT_DIR show -s --format=%cI HEAD)" >> $CRAFT_PART_INSTALL/git-info.txt
       fi
 
-base: ubuntu@24.04
 platforms:
-  amd64:
-    build-on: amd64
-    build-for: amd64
+  ubuntu-26.04-amd64:
+    build-on: [ubuntu@26.04:amd64]
+    build-for: [ubuntu@26.04:amd64]
+  ubuntu-24.04-amd64:
+    build-on: [ubuntu@24.04:amd64]
+    build-for: [ubuntu@24.04:amd64]

@@ -1,4 +1,5 @@
 #! /usr/bin/env python3
+import action_venv  # noqa: F401
 #
 # Copyright 2020 Canonical Ltd
 #

@@ -1,0 +1,13 @@
+[project]
+name = "ceph-nvme"
+version = "0.0.1"
+requires-python = ">=3.10"
+dependencies = [
+    "importlib-resources",
+    "ops>=1.2.0",
+    "ops-openstack @ git+https://opendev.org/openstack/charm-ops-openstack",
+    "interface-ceph-client @ git+https://opendev.org/openstack/charm-ops-interface-ceph-client",
+    "interface-ceph-iscsi-admin-access @ git+https://github.com/openstack-charmers/ops-interface-ceph-iscsi-admin-access",
+    "charmhelpers @ git+https://github.com/juju/charm-helpers",
+    "netifaces>=0.11.0",
+]

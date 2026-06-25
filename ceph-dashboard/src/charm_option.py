@@ -4,8 +4,12 @@
 #
 # Learn more at: https://juju.is/docs/sdk
 
+import logging
+
 import charmhelpers.core.host as ch_host
 from typing import List, Union
+
+logger = logging.getLogger(__name__)
 
 
 class CharmCephOption():
@@ -26,7 +30,14 @@ class CharmCephOption():
 
     def minimum_supported(self, supported_version: str) -> bool:
         """Check if installed Ceph release is >= to supported_version"""
-        return ch_host.cmp_pkgrevno('ceph-common', supported_version) >= 0
+        try:
+            return ch_host.cmp_pkgrevno('ceph-common', supported_version) >= 0
+        except (AttributeError, TypeError):
+            logger.warning(
+                "Unable to determine ceph-common version; treating %s as "
+                "unsupported",
+                self.charm_option_name)
+            return False
 
     def convert_option(self, value: Union[bool, str, int]) -> List[str]:
         """Convert a value to the corresponding value part of the ceph

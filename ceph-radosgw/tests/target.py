@@ -32,7 +32,6 @@ import zaza.openstack.utilities.ceph as zaza_ceph
 import zaza.openstack.utilities.generic as zaza_utils
 import zaza.utilities.networking as network_utils
 import zaza.utilities.juju as juju_utils
-import zaza.openstack.utilities.openstack as zaza_openstack
 import zaza.openstack.utilities.generic as generic_utils
 import zaza.openstack.utilities.openstack as openstack_utils
 
@@ -866,10 +865,8 @@ class CephRGWTest(test_utils.BaseCharmTest):
     def test_101_virtual_hosted_bucket(self):
         """Test virtual hosted bucket."""
         # skip if quincy or older
-        current_release = zaza_openstack.get_os_release(
-            application='ceph-mon')
-        reef = zaza_openstack.get_os_release('jammy_bobcat')
-        if current_release < reef:
+        if not test_utils.package_version_matches(
+                'ceph-mon', 'ceph-common', ['18.2.0'], 'ge'):
             raise unittest.SkipTest(
                 'Virtual hosted bucket not supported in quincy or older')
 

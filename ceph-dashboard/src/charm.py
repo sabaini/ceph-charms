@@ -15,6 +15,7 @@ import socket
 import string
 import subprocess
 import tempfile
+from subprocess import CalledProcessError
 from pathlib import Path
 from typing import List, Tuple, Union
 
@@ -284,12 +285,12 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
     def check_dashboard(self) -> StatusBase:
         """Check status of dashboard"""
         checks = [
-            (ceph_utils.is_dashboard_enabled, 'Dashboard is not enabled'),
             (self._check_for_certs, ('No certificates found. Please add a '
                                      'certifcates relation or provide via '
                                      'charm config')),
             (self._check_grafana_config, 'Charm config option grafana-api-url '
                                          'not set'),
+            (ceph_utils.is_dashboard_enabled, 'Dashboard is not enabled'),
             (self._check_dashboard_responding, 'Dashboard not responding')
         ]
         for check_f, msg in checks:
@@ -328,7 +329,16 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
                         option.charm_option_name))
                 continue
             if option.is_supported():
-                cmds.exec_option_ceph_cmd(option, value)
+                try:
+                    cmds.exec_option_ceph_cmd(option, value)
+                except FileNotFoundError:
+                    logging.warning(
+                        "Skipping charm option {}, ceph command not found".
+                        format(option.charm_option_name))
+                except CalledProcessError as exc:
+                    logging.warning(
+                        "Skipping charm option %s, ceph command failed: %s",
+                        option.charm_option_name, exc)
             else:
                 logging.warning(
                     "Skipping charm option {}, not supported".format(
@@ -619,9 +629,16 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
         if not base_url or not idp_metadata:
             return
 
-        cmds.ceph_dashboard_config_saml(
-            base_url, idp_metadata, username_attr, idp_entity_id
-        )
+        try:
+            cmds.ceph_dashboard_config_saml(
+                base_url, idp_metadata, username_attr, idp_entity_id
+            )
+        except CalledProcessError as exc:
+            stderr = getattr(exc, 'stderr', '') or ''
+            if 'Required library not found: `python3-saml`' in stderr:
+                logger.warning("Skipping SAML config: %s", stderr)
+                return
+            raise
 
     def _gen_user_password(self, length: int = 12) -> str:
         """Generate a password"""
@@ -653,7 +670,7 @@ class CephDashboardCharm(ops_openstack.core.OSBaseCharm):
         try:
             cmds.ceph_dashboard_delete_user(username)
             event.set_results({"message": "User {} deleted".format(username)})
-        except subprocess.CalledProcessError as exc:
+        except CalledProcessError as exc:
             event.fail(exc.output)
 
     def _is_charm_ssl_from_relation(self) -> bool:

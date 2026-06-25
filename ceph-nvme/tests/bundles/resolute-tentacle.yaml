@@ -1,0 +1,58 @@
+default-base: ubuntu@26.04
+
+machines:
+  '0':
+  '1':
+  '2':
+  '3':
+  '4':
+  '5':
+    constraints: cores=2 mem=6G root-disk=40G virt-type=virtual-machine
+  '6':
+    constraints: cores=2 mem=6G root-disk=40G virt-type=virtual-machine
+  '7':
+    constraints: cores=2 mem=6G root-disk=40G virt-type=virtual-machine
+
+applications:
+  ceph-mon:
+    charm: ch:ceph-mon
+    channel: tentacle/edge
+    num_units: 3
+    options:
+      monitor-count: 3
+      source: distro
+    to:
+      - '0'
+      - '1'
+      - '2'
+
+  ceph-nvme:
+    charm: ch:ceph-nvme
+    channel: tentacle/edge
+    num_units: 2
+    options:
+      nr-hugepages: 0
+      cpuset: "2"
+    to:
+      - '3'
+      - '4'
+
+  ceph-osd:
+    charm: ch:ceph-osd
+    channel: tentacle/edge
+    num_units: 3
+    options:
+      source: distro
+    storage:
+      osd-devices: 'loop,10G'
+    to:
+      - '5'
+      - '6'
+      - '7'
+
+relations:
+  - - 'ceph-mon'
+    - 'ceph-nvme'
+
+  - - 'ceph-osd:mon'
+    - 'ceph-mon:osd'

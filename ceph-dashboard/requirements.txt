@@ -1,7 +1,10 @@
+cryptography
 importlib-resources
-ops >= 1.2.0, <= 1.5.2
+netifaces >= 0.11.0
+ops >= 1.2.0
+psutil
 tenacity
-git+https://github.com/canonical/ceph-charms#egg=charms.ceph&subdirectory=charms.ceph
+git+https://github.com/canonical/ceph-charms.git#egg=charms_ceph&subdirectory=charms.ceph
 git+https://opendev.org/openstack/charm-ops-openstack#egg=ops_openstack
 git+https://opendev.org/openstack/charm-ops-interface-tls-certificates#egg=interface_tls_certificates
 git+https://github.com/openstack-charmers/ops-interface-ceph-iscsi-admin-access#egg=interface_ceph_iscsi_admin_access

@@ -4,7 +4,7 @@ gate_bundles:
 smoke_bundles:
   - noble-caracal
 dev_bundles:
-  - noble-caracal
+  - resolute-tentacle
 configure: []
 tests:
   - zaza.charm_tests.lifecycle.refresh.CharmRefreshAll
