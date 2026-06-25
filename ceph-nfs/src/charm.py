@@ -38,6 +38,8 @@ import ops_openstack.adapters
 import ops_openstack.core
 import ops_openstack.plugins.classes
 
+import charms_ceph.selog as selog
+
 logger = logging.getLogger(__name__)
 
 
@@ -195,6 +197,8 @@ class CephNFSCharm(
 
     def __init__(self, framework):
         super().__init__(framework)
+        selog.register_log_callback(lambda msg: logging.warn(msg))
+        selog.register_defaults({'appid': 'ceph.nfs'})
         # super().register_status_check(self.custom_status_check)
         logging.info("Using %s class", self.release)
         self._stored.set_default(
@@ -462,6 +466,9 @@ class CephNFSCharm(
             event.fail("Share creation needs to be run "
                        "from the application leader")
             return
+        selog.log('Creating share',
+                  event='authn_nfs_share',
+                  detail='nfs_share_create')
         share_size = event.params.get('size')
         name = event.params.get('name')
         allowed_ips = event.params.get('allowed-ips')
@@ -520,6 +527,9 @@ class CephNFSCharm(
             event.fail("Share creation needs to be run "
                        "from the application leader")
             return
+        selog.log('Granting access to share',
+                  event='authn_nfs_share',
+                  detail='nfs_share_grant')
         name = event.params.get('name')
         address = event.params.get('client')
         res = self.ganesha_client.grant_access(name, address)
@@ -536,6 +546,9 @@ class CephNFSCharm(
             event.fail("Share creation needs to be run "
                        "from the application leader")
             return
+        selog.log('Revoking access to share',
+                  event='authn_nfs_share',
+                  detail='nfs_share_revoke')
         name = event.params.get('name')
         address = event.params.get('client')
         res = self.ganesha_client.revoke_access(name, address)
