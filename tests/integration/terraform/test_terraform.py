@@ -286,6 +286,11 @@ variable "charm_channel" {{
   default = null
 }}
 
+variable "juju_base" {{
+  type    = string
+  default = null
+}}
+
 variable "bootstrap_source" {{
   type    = any
   default = null
@@ -323,6 +328,8 @@ module "ceph" {{
     }}
   }}, var.charm_channel == null ? {{}} : {{
     channel = var.charm_channel
+  }}, var.juju_base == null ? {{}} : {{
+    base = var.juju_base
   }})
 
   ceph_osd = merge({{
@@ -332,12 +339,17 @@ module "ceph" {{
     }}
   }}, var.charm_channel == null ? {{}} : {{
     channel = var.charm_channel
+  }}, var.juju_base == null ? {{}} : {{
+    base = var.juju_base
   }})
 
   ceph_radosgw = merge(
     var.ceph_radosgw,
     var.charm_channel == null ? {{}} : {{
       channel = var.charm_channel
+    }},
+    var.juju_base == null ? {{}} : {{
+      base = var.juju_base
     }},
   )
 }}
@@ -498,6 +510,17 @@ class TerraformController:
         return json.loads(result.stdout)
 
 
+def _terraform_environment(model_name: str) -> dict[str, str]:
+    """Return the Terraform environment for an integration test model."""
+    env = os.environ.copy()
+    env["TF_IN_AUTOMATION"] = "1"
+    env["JUJU_MODEL"] = model_name
+    env["TF_VAR_model_name"] = model_name
+    if juju_base := env.get("JUJU_BASE"):
+        env.setdefault("TF_VAR_juju_base", juju_base)
+    return env
+
+
 @pytest.fixture(scope="module")
 def terraform_controller(
     juju: jubilant.Juju, request: pytest.FixtureRequest
@@ -511,12 +534,7 @@ def terraform_controller(
 
     (workspace / "main.tf").write_text(_workspace_main(COMPONENT_MODULE_SOURCE))
 
-    env = os.environ.copy()
-    env["TF_IN_AUTOMATION"] = "1"
-    env["JUJU_MODEL"] = model_name
-    env["TF_VAR_model_name"] = model_name
-
-    controller = TerraformController(workspace, env)
+    controller = TerraformController(workspace, _terraform_environment(model_name))
     controller.init()
 
     keep_models = bool(request.config.getoption("--keep-models"))
