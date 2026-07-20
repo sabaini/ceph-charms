@@ -13,8 +13,9 @@ import pytest
 # while still meeting Ceph charm minimum requirements.
 MODEL_CONSTRAINTS = (
     "virt-type=virtual-machine",
-    "mem=4G",
-    "root-disk=16G",
+    "cores=4",
+    "mem=8G",
+    "root-disk=40G",
 )
 
 
