@@ -5,19 +5,20 @@
 #
 # Mirrors the main-branch cos-integration-test GitHub workflow job, but:
 #   - Builds ceph-mon locally (jammy) and deploys it from the local artifact,
-#     exactly like the GH workflow. ceph-osd comes from Charmhub quincy/candidate.
+#     exactly like the GH workflow. ceph-osd comes from Charmhub quincy/edge.
 #   - Deploys the COS agent on ubuntu@22.04 instead of ubuntu@24.04.
 #
 # Usage:
 #   bash ceph-mon/tests/workflow_assets/run-cos-integration.sh
 #
 # Env vars (all optional):
-#   AGENT    - grafana-agent (default; only supported value in this version)
+#   AGENT      - grafana-agent (default; only supported value in this version)
+#   REPO_ROOT  - path to the ceph-charms checkout (default: /home/ubuntu/src/ceph-charms)
 # ==============================================================================
 set -euo pipefail
 
 # --- Configuration ---
-REPO_ROOT="/home/ubuntu/src/ceph-charms"
+REPO_ROOT="${REPO_ROOT:-/home/ubuntu/src/ceph-charms}"
 ASSETS="$REPO_ROOT/ceph-mon/tests/workflow_assets"
 AGENT="${AGENT:-grafana-agent}"
 CEPH_MODEL="ceph-cos-test"
