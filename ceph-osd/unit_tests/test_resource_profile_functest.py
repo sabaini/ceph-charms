@@ -134,7 +134,6 @@ class BundleTemplateTest(unittest.TestCase):
         self.template = jinja2.Environment(
             undefined=jinja2.StrictUndefined).from_string(path.read_text())
         self.artifacts = {
-            'TEST_EPA_MON_CHARM': '/tmp/ceph-mon.charm',
             'TEST_EPA_OSD_CHARM': '/tmp/ceph-osd.charm',
             'TEST_EPA_SNAP': '/tmp/epa.snap',
         }
@@ -151,7 +150,8 @@ class BundleTemplateTest(unittest.TestCase):
         bundle = yaml.safe_load(self.template.render(**self.artifacts))
         mon = bundle['applications']['ceph-mon']
         osd = bundle['applications']['ceph-osd']
-        self.assertEqual(mon['charm'], '/tmp/ceph-mon.charm')
+        self.assertEqual(mon['charm'], 'ch:ceph-mon')
+        self.assertEqual(mon['channel'], 'tentacle/edge')
         self.assertEqual(osd['charm'], '/tmp/ceph-osd.charm')
         self.assertEqual(osd['resources'],
                          {'epa-orchestrator': '/tmp/epa.snap'})
