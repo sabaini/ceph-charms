@@ -1,4 +1,4 @@
-# All three artifact paths are mandatory, absolute paths on the Zaza runner.
+# Both local artifact paths are mandatory, absolute paths on the Zaza runner.
 # An undefined variable fails template rendering, before Juju deploys anything.
 default-base: ubuntu@24.04
 local_overlay_enabled: false
@@ -13,7 +13,8 @@ machines:
 
 applications:
   ceph-mon:
-    charm: {{ TEST_EPA_MON_CHARM | string | tojson }}
+    charm: ch:ceph-mon
+    channel: tentacle/edge
     num_units: 3
     options:
       source: distro

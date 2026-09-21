@@ -517,6 +517,11 @@ options:
       operation across this application's hosts. One host proceeds at a time;
       changed OSDs on that host are restarted sequentially. A failed host or
       a timed-out predecessor blocks the rollout rather than being skipped.
+
+      Note this feature needs a supported epa-orchestrator snap. Check the
+      epa-orchestrator documentation for support. Also see the epa-orchestrator
+      resource and epa-orchestrator-channel config option.
+      
   suppress-profile-warnings:
     type: boolean
     default: false

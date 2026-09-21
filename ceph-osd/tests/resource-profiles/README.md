@@ -40,21 +40,20 @@ scenarios rather than implicit claims of this test.
 
 ## Build and deploy locally
 
-Build the current charms for Ubuntu 24.04 and build the EPA snap from its local
-source tree using Charmcraft/Snapcraft. For example:
+The bundle uses `ch:ceph-mon` from `tentacle/edge`. Build the current ceph-osd
+charm for Ubuntu 24.04 and the EPA snap from its local source tree using
+Charmcraft/Snapcraft. For example:
 
 ```sh
-(cd ceph-mon && charmcraft -v pack --use-lxd --platform ubuntu-24.04-amd64)
 (cd ceph-osd && charmcraft -v pack --use-lxd --platform ubuntu-24.04-amd64)
 (cd ~/src/snap-epa-orchestrator && snapcraft -v pack --use-lxd)
 ```
 
-From the ceph-charms repository root, export **absolute paths** to those three
-artifacts. The bundle uses them directly; there is no store fallback in the
-bundle or automatic selection of an old charm artifact.
+From the ceph-charms repository root, export **absolute paths** to those two
+artifacts. The bundle uses the specified OSD charm and EPA snap directly,
+without a store fallback or automatic selection of an old local artifact.
 
 ```sh
-export TEST_EPA_MON_CHARM="$PWD/ceph-mon/ceph-mon_ubuntu-24.04-amd64.charm"
 export TEST_EPA_OSD_CHARM="$PWD/ceph-osd/ceph-osd_ubuntu-24.04-amd64.charm"
 export TEST_EPA_SNAP="$HOME/src/snap-epa-orchestrator/epa-orchestrator_2026.1-06648a34_amd64.snap"
 # Adjust the snap filename to your actual build output.
