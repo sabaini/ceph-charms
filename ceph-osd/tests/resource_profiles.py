@@ -424,7 +424,7 @@ class ResourceProfileRolloutTest(unittest.TestCase):
             # recorded local state as well as status to avoid a stale read.
             self._wait('unmanaged restored', lambda: (
                 self._active(profile) and all(
-                    self._allocation_status(u)['profile'] == profile
+                    self._allocation_status(u)['requested-profile'] == profile
                     for u in self.units)))
         else:
             self._wait('original profile restored',

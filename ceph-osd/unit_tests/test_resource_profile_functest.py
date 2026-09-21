@@ -208,3 +208,14 @@ class FailureCleanupTest(unittest.TestCase):
         self.case._config.assert_called_once_with(**{
             'performance-profile': 'unmanaged',
             'suppress-profile-warnings': False})
+        # Unmanaged retains the applied balanced allocation. Restoration must
+        # observe the requested profile, and reject stale pre-config state.
+        self.case.units = ['ceph-osd/3']
+        self.case._active = Mock(return_value=True)
+        self.case._allocation_status = Mock(return_value={
+            'profile': 'balanced', 'requested-profile': 'balanced'})
+        predicate = self.case._wait.call_args_list[-1].args[1]
+        self.assertFalse(predicate())
+        self.case._allocation_status.return_value['requested-profile'] = (
+            'unmanaged')
+        self.assertTrue(predicate())
