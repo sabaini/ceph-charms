@@ -45,7 +45,7 @@ class FakeKV(object):
 class FakeEpa(object):
     """A faithful-enough stand-in for the EPA orchestrator."""
 
-    FEATURES = ['non-preemptive-allocations']
+    FEATURES = ['non-preemptive-allocations', 'cpu-pools']
 
     def __init__(self, eligible, nodes, features=None, foreign=None,
                  source='configured'):
@@ -84,7 +84,14 @@ class FakeEpa(object):
             ],
         }
 
-    def wait_ready(self, **kwargs):
+    def wait_ready(self, discover=False, **kwargs):
+        if discover:
+            return {
+                'pool': 'isolated',
+                'supported_cpu_features': self.features,
+                'cpu_pool': {'configured_cpus': ''},
+                'allocations': [],
+            }
         return self.list_allocations()
 
     def supports_non_preemptive(self, listing=None):
@@ -395,6 +402,15 @@ class PerformanceReconcileTestCase(ManagerTestCase):
         state = self.reconcile(rp.PROFILE_PERFORMANCE, [osd(0)], epa)
         self.assertIn('non-preemptive', state['errors'][0])
         self.assertEqual(epa.claims, {})
+
+    def test_missing_named_pool_support_blocks_before_configuration(self):
+        self.ensure_installed.return_value = 'store'
+        epa = FakeEpa(range(0, 32), TWO_NODES,
+                      features=['non-preemptive-allocations'])
+        state = self.reconcile(rp.PROFILE_PERFORMANCE, [osd(0)], epa)
+        self.assertIn('cpu-pools', state['errors'][0])
+        self.assertEqual(epa.claims, {})
+        self.assertEqual(self.pools_set, [])
 
     def test_unreachable_allocator_blocks(self):
         class Unreachable(object):
@@ -1191,6 +1207,170 @@ class ClaimLifecycleTestCase(ManagerTestCase):
 
 class PoolManagementTestCase(ManagerTestCase):
 
+    def _assert_interrupted_activation_recovers(self, profile, offline=False):
+        self.ensure_installed.return_value = 'store'
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        running = {'alive': True, 'general': False}
+        durable = {}
+        self.kv.flush = lambda: durable.update(copy.deepcopy(self.kv.data))
+        original_wait = epa.wait_ready
+        original_list = epa.list_allocations
+
+        def listing():
+            if not running['general']:
+                raise epa_client.EpaRequestError(
+                    'CPU pool general is not configured')
+            return original_list()
+
+        def wait_ready(**kwargs):
+            if not running['alive']:
+                raise epa_client.EpaUnavailable('daemon is stopped')
+            return original_wait(**kwargs)
+
+        epa.list_allocations = listing
+        epa.wait_ready = wait_ready
+
+        def interrupted(cpus):
+            # Intent must be durable before snap set commits its configuration.
+            self.assertEqual(durable.get(resource_manager.PENDING_POOL_KEY),
+                             cpus)
+            self.pool = format_cpu_list(cpus)
+            running['alive'] = not offline
+            raise resource_manager.epa_snap.SnapError('restart interrupted')
+
+        self.set_pool.side_effect = interrupted
+        first = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(first['errors'], ['restart interrupted'])
+        self.assertEqual(self.pool, '12-15,28-31')
+        self.assertEqual(self.kv.get(resource_manager.PENDING_POOL_KEY),
+                         parse_cpu_list(self.pool))
+        self.assertEqual(self.applied, [])
+        self.assertEqual(epa.claims, {})
+
+        def activate(cpus):
+            running.update(alive=True, general=True)
+            return self._set_pool(cpus)
+
+        # A new hook sees only flushed data, not the prior in-memory database.
+        self.kv = FakeKV()
+        self.kv.data = copy.deepcopy(durable)
+        self.ensure_installed.return_value = 'present'
+        self.set_pool.side_effect = activate
+        second = self.reconcile(profile, [osd(0)], epa)
+        self.assertEqual(second['errors'], [])
+        self.assertIsNone(self.kv.get(resource_manager.PENDING_POOL_KEY))
+        self.assertEqual(self.pools_set[0], '12-15,28-31')
+        self.assertTrue(epa.claims['ceph-osd.0'])
+        self.assertTrue(self.applied)
+        attempts = self.set_pool.call_count
+        self.reconcile(profile, [osd(0)], epa)
+        self.assertEqual(self.set_pool.call_count, attempts)
+
+    def test_interrupted_bootstrap_retries_unchanged_demand(self):
+        self._assert_interrupted_activation_recovers(rp.PROFILE_MINIMAL)
+
+    def test_interrupted_bootstrap_retries_before_pool_growth(self):
+        self._assert_interrupted_activation_recovers(rp.PROFILE_BALANCED)
+        self.assertEqual(self.pools_set, ['12-15,28-31', '8-15,28-31'])
+
+    def test_interrupted_bootstrap_retries_before_daemon_readiness(self):
+        self._assert_interrupted_activation_recovers(
+            rp.PROFILE_MINIMAL, offline=True)
+
+    def test_persistent_activation_failure_retains_intent(self):
+        self.ensure_installed.return_value = 'store'
+        self.set_pool.side_effect = resource_manager.epa_snap.SnapError(
+            'restart failed')
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        for attempt in range(2):
+            state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+            self.assertEqual(state['errors'], ['restart failed'])
+            self.assertEqual(self.kv.get(resource_manager.PENDING_POOL_KEY),
+                             parse_cpu_list('12-15,28-31'))
+            self.ensure_installed.return_value = 'present'
+        self.assertEqual(self.set_pool.call_count, 2)
+        self.assertEqual(self.applied, [])
+        self.assertEqual(epa.claims, {})
+
+    def test_activation_requires_successful_pool_confirmation(self):
+        self.ensure_installed.return_value = 'store'
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        original_wait = epa.wait_ready
+
+        def wait_ready(discover=False, **kwargs):
+            if not discover:
+                raise epa_client.EpaUnsupported('pool not confirmed')
+            return original_wait(discover=True, **kwargs)
+
+        epa.wait_ready = wait_ready
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], ['pool not confirmed'])
+        self.assertEqual(self.kv.get(resource_manager.PENDING_POOL_KEY),
+                         parse_cpu_list('12-15,28-31'))
+        self.assertEqual(epa.claims, {})
+
+    def test_activation_rejects_changed_daemon_capabilities(self):
+        self.ensure_installed.return_value = 'store'
+        self.set_pool.side_effect = epa_client.EpaUnsupported(
+            'cpu-pools not supported after restart')
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertIn('cpu-pools not supported', state['errors'][0])
+        self.assertTrue(self.kv.get(resource_manager.PENDING_POOL_KEY))
+        self.assertEqual(self.applied, [])
+        self.assertEqual(epa.claims, {})
+
+    def test_unjournaled_pool_failure_does_not_trigger_restart(self):
+        self.kv.set(resource_manager.MANAGED_KEY, True)
+        self.pool = '12-15,28-31'
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+
+        def listing():
+            raise epa_client.EpaRequestError('general pool is not configured')
+
+        epa.list_allocations = listing
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], ['general pool is not configured'])
+        self.set_pool.assert_not_called()
+        self.assertIsNone(self.kv.get(resource_manager.PENDING_POOL_KEY))
+        self.assertEqual(epa.claims, {})
+
+    def test_pending_activation_does_not_change_external_installation(self):
+        pending = [12, 13, 14, 15]
+        self.kv.set(resource_manager.PENDING_POOL_KEY, pending)
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.set_pool.assert_not_called()
+        self.get_configured_pool.assert_not_called()
+        self.assertEqual(self.kv.get(resource_manager.PENDING_POOL_KEY),
+                         pending)
+
+    def test_missing_capability_does_not_create_activation_intent(self):
+        self.ensure_installed.return_value = 'store'
+        epa = FakeEpa(range(0, 32), TWO_NODES, features=[])
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertTrue(state['errors'])
+        self.set_pool.assert_not_called()
+        self.assertIsNone(self.kv.get(resource_manager.PENDING_POOL_KEY))
+        self.assertEqual(epa.claims, {})
+
+    def test_isolated_capacity_is_excluded_from_general_pool(self):
+        self.ensure_installed.return_value = 'store'
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        original = epa.wait_ready
+
+        def wait_ready(discover=False, **kwargs):
+            listing = original(discover=discover, **kwargs)
+            if discover:
+                listing['cpu_pool']['configured_cpus'] = '12-15,28-31'
+            return listing
+
+        epa.wait_ready = wait_ready
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(self.pools_set, ['8-11,24-27'])
+        self.assertEqual(state['errors'], [])
+
     def test_pool_is_untouched_for_a_pre_existing_snap(self):
         epa = FakeEpa(range(0, 16), TWO_NODES)
         self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
@@ -1221,6 +1401,7 @@ class PoolManagementTestCase(ManagerTestCase):
 
     def test_pool_accounts_for_cpus_held_by_other_workloads(self):
         self.ensure_installed.return_value = 'store'
+        self.pool = '14-15'
         epa = FakeEpa(range(0, 32), TWO_NODES,
                       foreign={'nova-compute': [14, 15]})
         self.reconcile(rp.PROFILE_BALANCED, [osd(0)], epa)

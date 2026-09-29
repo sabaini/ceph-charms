@@ -754,6 +754,7 @@ def _is_int(v):
 
 def get_version():
     """Derive Ceph release from an installed package."""
+    # apt_cache() initializes apt_pkg only when it is already imported.
     try:
         import apt_pkg as apt
     except ImportError:

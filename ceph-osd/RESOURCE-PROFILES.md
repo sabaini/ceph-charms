@@ -82,8 +82,9 @@ charm:
 * otherwise installs the `epa-orchestrator` charm resource, falling back
   to the store channel in `epa-orchestrator-channel`, and then owns the
   CPU pool;
-* requires the daemon to advertise `non-preemptive-allocations` and to
-  confirm `preemption_policy: non-preemptive` on every claim. Without
+* requires the daemon to advertise `non-preemptive-allocations` and
+  `cpu-pools`, and to confirm both `pool: general` and
+  `preemption_policy: non-preemptive` on every claim. Without
   that confirmation the unit blocks rather than taking an allocation that
   another client could reclaim;
 * uses one EPA service identity per OSD, `ceph-osd.<id>`.
@@ -93,9 +94,13 @@ processes or activates kernel isolation.
 
 ### CPU pool
 
-By default EPA only offers the CPUs in
-`/sys/devices/system/cpu/isolated`, which is normally empty. When the
-charm owns the installation it configures an explicit pool instead:
+EPA defaults requests to the `isolated` pool, even when `cpu-pool` is
+configured. The charm explicitly selects `general` for listing, allocation,
+and release. An externally managed snap must already have a general pool
+configured and its daemon restarted. The charm checks capabilities through
+the default isolated listing before attempting any general-pool operation.
+
+When the charm owns the installation it configures the general pool:
 
 * every NUMA node contributes CPUs, so NUMA-aligned requests can be
   served wherever an OSD's device lives;
@@ -103,9 +108,18 @@ charm owns the installation it configures an explicit pool instead:
   75% of that node's logical CPUs;
 * whole physical cores are preferred, selected from the highest numbered
   cores downwards, and CPU 0 with its SMT siblings is never offered;
+* isolated CPUs are excluded, because EPA requires disjoint pools;
 * the pool only ever grows. Shrinking it requires coordinated workload
   migration, and EPA rejects pool changes that exclude CPUs it already
   granted.
+
+Pool changes are journaled before configuring the snap. If configuration or
+restart is interrupted, the next managed reconciliation retries activation
+before checking daemon readiness, even when profile demand is unchanged.
+The pending change is cleared only after the general pool answers successfully.
+An old interrupted change made before this journal existed still requires
+`sudo snap restart epa-orchestrator.daemon` before retrying reconciliation;
+the charm does not infer permission to restart from arbitrary listing errors.
 
 Note that pool eligibility is accounting, not kernel isolation: nothing
 prevents unrelated host processes from running on those CPUs.

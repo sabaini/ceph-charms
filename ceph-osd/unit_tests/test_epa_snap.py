@@ -232,6 +232,16 @@ class PoolComputationTestCase(unittest.TestCase):
         merged, changed = epa_snap.grow_pool(None, [4, 5])
         self.assertEqual((merged, changed), ([4, 5], True))
 
+    def test_grow_pool_from_isolated_default(self):
+        self.assertEqual(epa_snap.grow_pool('isolated', [4, 5]),
+                         ([4, 5], True))
+
+    def test_general_pool_excludes_isolated_cpus(self):
+        pool = epa_snap.compute_pool(
+            {0: list(range(16))}, demand_by_node={0: 8},
+            excluded_cpus=range(8, 16), root=self.root)
+        self.assertEqual(pool, list(range(1, 8)))
+
     def test_grow_pool_no_change(self):
         merged, changed = epa_snap.grow_pool('4-5', [4, 5])
         self.assertEqual((merged, changed), ([4, 5], False))

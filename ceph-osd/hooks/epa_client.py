@@ -40,6 +40,8 @@ READY_INTERVAL = 2
 
 POLICY_NON_PREEMPTIVE = 'non-preemptive'
 FEATURE_NON_PREEMPTIVE = 'non-preemptive-allocations'
+FEATURE_CPU_POOLS = 'cpu-pools'
+CPU_POOL = 'general'
 
 # Full release of every claim a service owns.
 RELEASE_ALL = -1
@@ -92,6 +94,7 @@ class EpaClient(object):
     def __init__(self, socket_path=SOCKET_PATH, timeout=30):
         self.socket_path = socket_path
         self.timeout = timeout
+        self._capabilities = None
 
     def _request(self, payload):
         """Send one JSON request and return the decoded response.
@@ -137,23 +140,60 @@ class EpaClient(object):
             raise EpaRequestError(response['error'])
         return response
 
+    def discover(self):
+        """Check capabilities through the always-available isolated pool.
+
+        This must work before the charm configures the general pool. Older
+        daemons silently ignore pool selectors, so reject them before sending
+        any general-pool request, especially a mutation.
+        """
+        listing = self._request({
+            'action': 'list_allocations',
+            'service_name': 'ceph-osd-charm',
+        })
+        features = listing.get('supported_cpu_features') or []
+        for feature in (FEATURE_NON_PREEMPTIVE, FEATURE_CPU_POOLS):
+            if feature not in features:
+                raise EpaUnsupported(
+                    'EPA orchestrator does not support {}'.format(feature))
+        if any(osd_id_for(entry.get('service_name')) is not None
+               for entry in listing.get('allocations') or []):
+            raise EpaUnsupported(
+                'EPA has ceph-osd claims in the isolated pool; stop the '
+                'affected OSDs and release their original claims before '
+                'using the general pool')
+        self._capabilities = listing
+        return listing
+
+    def _pool_request(self, payload):
+        """Select and verify the pool for listing, claims and releases."""
+        if self._capabilities is None:
+            self.discover()
+        response = self._request(dict(payload, pool=CPU_POOL))
+        if response.get('pool') != CPU_POOL:
+            raise EpaUnsupported(
+                'EPA orchestrator did not confirm the {} pool (got {!r})'
+                .format(CPU_POOL, response.get('pool')))
+        return response
+
     def list_allocations(self):
         """Return the daemon's current allocation and pool state.
 
         :rtype: dict
         """
-        return self._request({
+        return self._pool_request({
             'action': 'list_allocations',
             'service_name': 'ceph-osd-charm',
         })
 
     def wait_ready(self, timeout=READY_TIMEOUT, interval=READY_INTERVAL,
-                   now=time.time, sleep=time.sleep):
+                   now=time.time, sleep=time.sleep, discover=False):
         """Wait for the daemon to answer, and return its state.
 
         A freshly installed or restarted daemon rebinds its socket, so a
         request issued immediately after ``snap install``/``snap
         restart`` can be refused even though the daemon is healthy.
+        Set ``discover`` to check capabilities before general capacity exists.
 
         :rtype: dict
         :raises EpaUnavailable: the daemon never answered
@@ -161,7 +201,7 @@ class EpaClient(object):
         deadline = now() + timeout
         while True:
             try:
-                return self.list_allocations()
+                return self.discover() if discover else self.list_allocations()
             except EpaUnavailable as exc:
                 failure = exc
             if now() >= deadline:
@@ -197,7 +237,7 @@ class EpaClient(object):
         :returns: the claimed logical CPU IDs
         :rtype: list[int]
         """
-        response = self._check_policy(self._request({
+        response = self._check_policy(self._pool_request({
             'action': 'allocate_numa_cores',
             'service_name': service,
             'numa_node': numa_node,
@@ -212,7 +252,7 @@ class EpaClient(object):
         :returns: the claimed logical CPU IDs
         :rtype: list[int]
         """
-        response = self._check_policy(self._request({
+        response = self._check_policy(self._pool_request({
             'action': 'allocate_cores',
             'service_name': service,
             'num_of_cores': count,
@@ -222,7 +262,7 @@ class EpaClient(object):
 
     def release_numa_node(self, service, numa_node):
         """Release the CPUs a service holds on a single NUMA node."""
-        self._request({
+        self._pool_request({
             'action': 'allocate_numa_cores',
             'service_name': service,
             'numa_node': numa_node,
@@ -231,7 +271,7 @@ class EpaClient(object):
 
     def release(self, service):
         """Release every CPU claim a service holds."""
-        self._request({
+        self._pool_request({
             'action': 'allocate_cores',
             'service_name': service,
             'num_of_cores': RELEASE_ALL,

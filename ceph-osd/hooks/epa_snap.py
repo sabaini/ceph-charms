@@ -18,10 +18,9 @@ An EPA orchestrator that is already present on the host is left
 completely alone: it is assumed to be managed by the operator or
 another charm, so neither its channel nor its ``cpu-pool`` is touched.
 
-When the charm installs the snap itself it also owns the CPU pool.  By
-default EPA only offers ``isolated`` CPUs, which is normally empty, so
-the charm configures an explicit pool instead: a conservative share of
-each NUMA node's logical CPUs, grown as profile demand requires.
+When the charm installs the snap itself it also owns the general CPU pool:
+a conservative share of each NUMA node's non-isolated logical CPUs, grown
+as profile demand requires. EPA's default isolated pool stays separate.
 """
 
 import math
@@ -187,7 +186,7 @@ def set_pool(cpus):
     return pool
 
 
-def _select_node_cpus(cpus, want, root='/'):
+def _select_node_cpus(cpus, want, root='/', excluded_cpus=()):
     """Pick ``want`` logical CPUs from a node, preferring whole cores.
 
     CPU 0 and its SMT siblings are never selected: they are left for
@@ -198,6 +197,9 @@ def _select_node_cpus(cpus, want, root='/'):
     """
     groups = physical_cores(cpus, root=root)
     groups = [g for g in groups if 0 not in g]
+    excluded = set(excluded_cpus)
+    groups = [[cpu for cpu in group if cpu not in excluded]
+              for group in groups]
     selected = []
     for group in reversed(groups):
         if len(selected) >= want:
@@ -209,7 +211,7 @@ def _select_node_cpus(cpus, want, root='/'):
 
 def compute_pool(nodes, demand_by_node=None, unbound_demand=0,
                  floor_percent=DEFAULT_POOL_PERCENT,
-                 cap_percent=MAX_POOL_PERCENT, root='/'):
+                 cap_percent=MAX_POOL_PERCENT, root='/', excluded_cpus=()):
     """Compute the CPU pool the charm should offer to EPA.
 
     Every NUMA node contributes CPUs, so that NUMA-aligned requests can
@@ -223,6 +225,7 @@ def compute_pool(nodes, demand_by_node=None, unbound_demand=0,
     :type demand_by_node: dict[int, int] or None
     :param unbound_demand: demand without NUMA locality, spread evenly
     :type unbound_demand: int
+    :param excluded_cpus: isolated CPUs, which cannot join the general pool
     :returns: logical CPU IDs for the pool
     :rtype: list[int]
     """
@@ -237,7 +240,8 @@ def compute_pool(nodes, demand_by_node=None, unbound_demand=0,
         floor = int(math.ceil(len(cpus) * floor_percent / 100.0))
         cap = int(math.floor(len(cpus) * cap_percent / 100.0))
         want = min(max(demand, floor), max(cap, 1))
-        pool.extend(_select_node_cpus(cpus, want, root=root))
+        pool.extend(_select_node_cpus(
+            cpus, want, root=root, excluded_cpus=excluded_cpus))
     return sorted(pool)
 
 
@@ -255,7 +259,8 @@ def grow_pool(current, desired):
     :returns: tuple of (merged CPU IDs, whether a change is needed)
     :rtype: tuple[list[int], bool]
     """
-    existing = set(parse_cpu_list(current or ''))
+    existing = set(parse_cpu_list(
+        '' if current is None or current.strip() == 'isolated' else current))
     wanted = set(desired)
     merged = sorted(existing | wanted)
     return merged, merged != sorted(existing)
