@@ -41,6 +41,7 @@ def allocations():
         sock.sendall(json.dumps({
             'version': '1.0', 'service_name': 'ceph-profile-functest',
             'action': 'list_allocations',
+            'pool': 'general',
         }).encode())
         chunks = []
         while True:
@@ -49,6 +50,9 @@ def allocations():
                 break
             chunks.append(data)
     result = json.loads(b''.join(chunks))
+    if result.get('pool') != 'general':
+        raise RuntimeError('EPA did not confirm the general pool: {}'.format(
+            result))
     return sorted(result['allocations'], key=lambda a: a['service_name'])
 
 

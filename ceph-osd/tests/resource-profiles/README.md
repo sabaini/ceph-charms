@@ -49,6 +49,10 @@ Charmcraft/Snapcraft. For example:
 (cd ~/src/snap-epa-orchestrator && snapcraft -v pack --use-lxd)
 ```
 
+Charmcraft packages the checked-in `ceph-osd/lib/charms_ceph` library directly.
+After changing `charms.ceph/charms_ceph`, refresh that vendored copy before
+building.
+
 From the ceph-charms repository root, export **absolute paths** to those two
 artifacts. The bundle uses the specified OSD charm and EPA snap directly,
 without a store fallback or automatic selection of an old local artifact.
@@ -113,3 +117,23 @@ The test oracle itself has fast unit tests (no Zaza dependency needed):
 python3 -m unittest discover -s ceph-osd/unit_tests \
   -p test_resource_profile_functest.py -v
 ```
+
+## EPA source compatibility check
+
+The socket contract check runs without Juju, a snap installation, or live OSDs.
+It uses the charm client with the real EPA dispatcher and persistence code,
+with temporary state and simulated CPU topology. From the repository root:
+
+```sh
+git clone https://github.com/canonical/snap-epa-orchestrator /tmp/epa-source
+python3 -m venv /tmp/epa-contract-venv
+/tmp/epa-contract-venv/bin/pip install 'pydantic>=2,<3'
+PYTHONPATH=/tmp/epa-source /tmp/epa-contract-venv/bin/python \
+    ceph-osd/tests/epa_contract.py
+```
+
+This covers general-pool selection, isolation from legacy owners, NUMA and
+count allocations, restart persistence, release with missing online topology,
+and failed persistence. It does not replace the installed-snap rollout suite
+above. The charm requires both `cpu-pools` and `non-preemptive-allocations`;
+an externally managed snap must have its general pool configured and restarted.

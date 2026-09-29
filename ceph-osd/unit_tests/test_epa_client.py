@@ -81,15 +81,21 @@ class ServiceNameTestCase(unittest.TestCase):
 
 class EpaClientTestCase(unittest.TestCase):
 
-    def daemon(self, responses):
-        daemon = FakeEpaDaemon(responses)
+    def daemon(self, responses, features=None):
+        discovery = {
+            'pool': 'isolated',
+            'supported_cpu_features': (
+                ['non-preemptive-allocations', 'cpu-pools']
+                if features is None else features),
+        }
+        daemon = FakeEpaDaemon([discovery] + responses)
         self.addCleanup(daemon.stop)
         client = epa_client.EpaClient(socket_path=daemon.path, timeout=5)
         return daemon, client
 
     def test_list_allocations(self):
         listing = {
-            'version': '1.0',
+            'version': '1.0', 'pool': 'general',
             'supported_cpu_features': ['non-preemptive-allocations'],
             'cpu_pool': {'source': 'configured', 'eligible_cpus': '4-11'},
             'allocations': [
@@ -100,8 +106,8 @@ class EpaClientTestCase(unittest.TestCase):
         }
         daemon, client = self.daemon([listing])
         self.assertEqual(client.list_allocations(), listing)
-        self.assertEqual(daemon.requests[0], {
-            'version': '1.0',
+        self.assertEqual(daemon.requests[1], {
+            'version': '1.0', 'pool': 'general',
             'action': 'list_allocations',
             'service_name': 'ceph-osd-charm',
         })
@@ -116,7 +122,7 @@ class EpaClientTestCase(unittest.TestCase):
 
     def test_allocate_numa_cores(self):
         daemon, client = self.daemon([{
-            'version': '1.0',
+            'version': '1.0', 'pool': 'general',
             'service_name': 'ceph-osd.1',
             'numa_node': 1,
             'num_of_cores': 4,
@@ -125,8 +131,8 @@ class EpaClientTestCase(unittest.TestCase):
         }])
         self.assertEqual(client.allocate_numa_cores('ceph-osd.1', 1, 4),
                          [12, 13, 14, 15])
-        self.assertEqual(daemon.requests[0], {
-            'version': '1.0',
+        self.assertEqual(daemon.requests[1], {
+            'version': '1.0', 'pool': 'general',
             'action': 'allocate_numa_cores',
             'service_name': 'ceph-osd.1',
             'numa_node': 1,
@@ -136,7 +142,7 @@ class EpaClientTestCase(unittest.TestCase):
 
     def test_allocate_cores(self):
         daemon, client = self.daemon([{
-            'version': '1.0',
+            'version': '1.0', 'pool': 'general',
             'service_name': 'ceph-osd.1',
             'num_of_cores': 2,
             'cores_allocated': 2,
@@ -144,18 +150,60 @@ class EpaClientTestCase(unittest.TestCase):
             'preemption_policy': 'non-preemptive',
         }])
         self.assertEqual(client.allocate_cores('ceph-osd.1', 2), [6, 9])
-        self.assertEqual(daemon.requests[0]['action'], 'allocate_cores')
-        self.assertEqual(daemon.requests[0]['preemption_policy'],
+        self.assertEqual(daemon.requests[1]['action'], 'allocate_cores')
+        self.assertEqual(daemon.requests[1]['preemption_policy'],
                          'non-preemptive')
 
     def test_allocation_rejects_unconfirmed_policy(self):
         _, client = self.daemon([{
-            'version': '1.0',
+            'version': '1.0', 'pool': 'general',
             'service_name': 'ceph-osd.1',
             'allocated_cores': '6,9',
         }])
         self.assertRaises(epa_client.EpaUnsupported,
                           client.allocate_cores, 'ceph-osd.1', 2)
+
+    def test_missing_pool_support_prevents_mutations(self):
+        for operation in ('allocate_cores', 'release', 'release_numa_node'):
+            with self.subTest(operation=operation):
+                daemon, client = self.daemon(
+                    [], features=['non-preemptive-allocations'])
+                args = ('ceph-osd.1',) if operation == 'release' else (
+                    'ceph-osd.1', 2)
+                self.assertRaises(epa_client.EpaUnsupported,
+                                  getattr(client, operation), *args)
+                self.assertEqual(len(daemon.requests), 1)
+                self.assertEqual(daemon.requests[0]['action'],
+                                 'list_allocations')
+                self.assertNotIn('pool', daemon.requests[0])
+
+    def test_rejects_missing_or_wrong_pool_confirmation(self):
+        for pool in (None, 'isolated'):
+            with self.subTest(pool=pool):
+                _, client = self.daemon([{
+                    'pool': pool, 'allocated_cores': '6,9',
+                    'preemption_policy': 'non-preemptive',
+                }])
+                self.assertRaises(epa_client.EpaUnsupported,
+                                  client.allocate_cores, 'ceph-osd.1', 2)
+
+    def test_discovery_before_general_pool_is_configured(self):
+        daemon, client = self.daemon([])
+        self.assertEqual(client.wait_ready(discover=True)['pool'], 'isolated')
+        self.assertEqual(len(daemon.requests), 1)
+
+    def test_old_isolated_claims_require_migration(self):
+        daemon = FakeEpaDaemon([{
+            'supported_cpu_features': ['non-preemptive-allocations',
+                                       'cpu-pools'],
+            'allocations': [{'service_name': 'ceph-osd.1'}],
+        }])
+        self.addCleanup(daemon.stop)
+        client = epa_client.EpaClient(socket_path=daemon.path, timeout=5)
+        with self.assertRaisesRegex(epa_client.EpaUnsupported,
+                                    'original claims'):
+            client.release('ceph-osd.1')
+        self.assertEqual(len(daemon.requests), 1)
 
     def test_allocation_error_response(self):
         _, client = self.daemon([
@@ -167,20 +215,23 @@ class EpaClientTestCase(unittest.TestCase):
 
     def test_release(self):
         daemon, client = self.daemon([
-            {'version': '1.0', 'service_name': 'ceph-osd.1',
+            {'version': '1.0', 'pool': 'general', 'service_name': 'ceph-osd.1',
              'num_of_cores': -1, 'cores_allocated': 0,
              'allocated_cores': ''},
-            {'version': '1.0', 'service_name': 'ceph-osd.1', 'numa_node': 0,
+            {'version': '1.0', 'pool': 'general', 'service_name': 'ceph-osd.1',
+             'numa_node': 0,
              'num_of_cores': -1, 'cores_allocated': ''},
         ])
         client.release('ceph-osd.1')
         client.release_numa_node('ceph-osd.1', 0)
-        self.assertEqual(daemon.requests[0]['num_of_cores'], -1)
-        self.assertNotIn('preemption_policy', daemon.requests[0])
-        self.assertEqual(daemon.requests[1]['numa_node'], 0)
+        self.assertEqual(daemon.requests[1]['num_of_cores'], -1)
+        self.assertNotIn('preemption_policy', daemon.requests[1])
+        self.assertEqual(daemon.requests[2]['numa_node'], 0)
+        self.assertEqual(daemon.requests[1]['pool'], 'general')
+        self.assertEqual(daemon.requests[2]['pool'], 'general')
 
     def test_wait_ready_returns_immediately(self):
-        daemon, client = self.daemon([{'version': '1.0',
+        daemon, client = self.daemon([{'version': '1.0', 'pool': 'general',
                                        'supported_cpu_features': []}])
         slept = []
         self.assertEqual(

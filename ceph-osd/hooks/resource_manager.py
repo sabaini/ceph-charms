@@ -84,6 +84,7 @@ from resource_profiles import (
 
 STATE_KEY = 'resource-alloc.state'
 MANAGED_KEY = 'resource-alloc.epa-charm-managed'
+PENDING_POOL_KEY = 'resource-alloc.epa-pending-pool'
 STATE_VERSION = 1
 AFFINITY_PROTECTION_VERSION = 1
 
@@ -725,6 +726,26 @@ def _pool_demand(plan, host, listing, own_services):
     return demand
 
 
+def _activate_epa_pool(cpus, client):
+    """Journal pool activation across snap configuration and daemon restart.
+
+    The caller has established ownership and capability support before creating
+    this intent. Replay it before probing readiness: the previous restart may
+    have left the daemon stopped or still serving its old pool.
+    """
+    database = kv()
+    database.set(PENDING_POOL_KEY, list(cpus))
+    database.flush()
+    try:
+        epa_snap.set_pool(cpus)
+        listing = client.wait_ready()
+    except (epa_snap.SnapError, EpaError) as exc:
+        raise ResourceError(str(exc))
+    database.set(PENDING_POOL_KEY, None)
+    database.flush()
+    return listing
+
+
 def _ensure_epa(plan, host, own_services, client_factory=EpaClient):
     """Ensure the EPA orchestrator is installed and has capacity.
 
@@ -749,33 +770,43 @@ def _ensure_epa(plan, host, own_services, client_factory=EpaClient):
     charm_managed = _epa_charm_managed()
 
     client = client_factory()
+    pending_pool = kv().get(PENDING_POOL_KEY)
+    if charm_managed and pending_pool:
+        _activate_epa_pool(pending_pool, client)
     try:
         # A freshly installed daemon may still be binding its socket.
-        listing = client.wait_ready()
+        discovery = client.wait_ready(discover=True)
     except EpaError as exc:
         raise ResourceError(str(exc))
 
-    if not client.supports_non_preemptive(listing):
+    if not client.supports_non_preemptive(discovery):
         raise ResourceError(
             'the installed EPA orchestrator does not support '
             'non-preemptive allocations, which this charm requires')
+    if 'cpu-pools' not in (discovery.get('supported_cpu_features') or []):
+        raise ResourceError(
+            'the installed EPA orchestrator does not support cpu-pools, '
+            'which this charm requires')
 
+    configured = epa_snap.get_configured_pool() if charm_managed else None
+    listing = {}
+    if not charm_managed or (configured and configured.strip() != 'isolated'):
+        try:
+            listing = client.list_allocations()
+        except EpaError as exc:
+            raise ResourceError(str(exc))
     if charm_managed:
         desired = epa_snap.compute_pool(
             host.nodes,
             demand_by_node=_pool_demand(plan, host, listing, own_services),
-            unbound_demand=plan.demand_unbound())
+            unbound_demand=plan.demand_unbound(),
+            excluded_cpus=parse_cpu_list(
+                (discovery.get('cpu_pool') or {}).get('configured_cpus')
+                or ''))
         merged, changed = epa_snap.grow_pool(
-            epa_snap.get_configured_pool(), desired)
+            configured, desired)
         if changed:
-            try:
-                epa_snap.set_pool(merged)
-            except epa_snap.SnapError as exc:
-                raise ResourceError(str(exc))
-            try:
-                listing = client.wait_ready()
-            except EpaError as exc:
-                raise ResourceError(str(exc))
+            listing = _activate_epa_pool(merged, client)
 
     epa_state = {
         'charm-managed': charm_managed,
