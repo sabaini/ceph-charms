@@ -131,10 +131,15 @@ Each OSD gets a systemd drop-in at
 
 ```
 [Service]
+CPUAffinity=
 CPUAffinity=4-15
 NUMAPolicy=bind
+NUMAMask=
 NUMAMask=0
 ```
+
+systemd merges `CPUAffinity` and `NUMAMask` assignments from the unit and its
+drop-ins, so the empty assignments discard any mask set before this drop-in.
 
 For a managed profile (and while a retained applied allocation exists), the
 charm-owned `ceph.conf` also renders these OSD settings **after** user
