@@ -211,7 +211,10 @@ cluster-wide mutex or a guarantee that all placement groups are clean.
   Claims, drop-ins and records for OSDs that no longer exist on the host
   are released on the next recalculation, including when no OSD remains;
   an OSD whose systemd unit is still active keeps its claim.
-* Unit teardown (`stop`) releases every claim this unit owns.
+* Unit teardown (`stop`) stops each OSD with a recorded allocation, drop-in
+  or claim, then releases
+  every claim this unit owns. If a release fails the hook fails, so that
+  the claims are not orphaned; resolving the unit retries the cleanup.
 * Switching to `unmanaged` keeps the current allocation and enforcement
   in place. The status records `requested-profile: unmanaged` separately
   from the last applied managed profile so the retained claim, affinity and
