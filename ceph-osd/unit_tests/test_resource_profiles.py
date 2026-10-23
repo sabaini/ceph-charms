@@ -31,12 +31,31 @@ def osd(osd_id, tier=rp.TIER_NVME, data_node=0, aux_nodes=None,
     )
 
 
-def host(nodes=None, nic_nodes=(0,), interface='eth0'):
+def host(nodes=None, nic_nodes=(0,), interface='eth0', networks=()):
     """Build host facts for the planner."""
     if nodes is None:
         nodes = {0: list(range(0, 8)), 1: list(range(8, 16))}
     return rp.HostFacts(nodes=nodes, nic_interface=interface,
-                        nic_nodes=set(nic_nodes))
+                        nic_nodes=set(nic_nodes), networks=tuple(networks))
+
+
+def nic(interface, address, nodes, problems=()):
+    return rp.Nic(interface=interface, address=address,
+                  nodes=frozenset(nodes), problems=tuple(problems))
+
+
+ETH0 = nic('eth0', '10.0.0.5', [0])
+ETH1 = nic('eth1', '10.0.1.5', [1])
+
+
+def networks(public=(ETH0, ETH1), cluster=None, default=ETH0,
+             cluster_default=None):
+    """Public and cluster network facts; cluster mirrors public."""
+    if cluster is None:
+        cluster = public
+    return [rp.NetworkFacts(rp.ROLE_PUBLIC, default, tuple(public)),
+            rp.NetworkFacts(rp.ROLE_CLUSTER, cluster_default or default,
+                            tuple(cluster))]
 
 
 SINGLE_NODE = {0: list(range(0, 16))}
@@ -263,9 +282,214 @@ class SerialisationTestCase(unittest.TestCase):
             'mode': rp.MODE_NUMA,
             'numa-node': 1,
             'numa-policy': 'preferred',
+            'addresses': {},
             'deviations': [],
         }])
 
     def test_request_repr(self):
         plan = rp.build_plan(rp.PROFILE_MINIMAL, [osd(2)], host())
         self.assertIn("osd_id='2'", repr(plan.requests[0]))
+
+
+class NumaAddressingTestCase(unittest.TestCase):
+
+    def addresses(self, plan):
+        return dict((r.osd_id, r.addresses) for r in plan.requests)
+
+    def test_each_osd_binds_its_node_address(self):
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE,
+                             [osd(0, data_node=0), osd(1, data_node=1)],
+                             host(networks=networks()))
+        self.assertTrue(plan.satisfiable, plan.errors)
+        self.assertEqual(self.addresses(plan), {
+            '0': {'public': '10.0.0.5', 'cluster': '10.0.0.5'},
+            '1': {'public': '10.0.1.5', 'cluster': '10.0.1.5'},
+        })
+        self.assertEqual(plan.deviations(), [])
+
+    def test_single_interface_keeps_the_host_address(self):
+        # Today's layout: the strict check applies to the one Ceph NIC.
+        single = networks(public=(ETH0,))
+        plan = rp.build_plan(rp.PROFILE_BALANCED, [osd(0, data_node=1)],
+                             host(networks=single))
+        self.assertEqual(self.addresses(plan), {'0': {}})
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(0, data_node=1)],
+                             host(networks=single))
+        self.assertIn('Ceph network interface eth0 is on node(s) 0',
+                      plan.errors[0])
+
+    def test_single_node_host_never_binds_addresses(self):
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(0, data_node=0)],
+                             host(nodes=SINGLE_NODE, networks=networks()))
+        self.assertEqual(self.addresses(plan), {'0': {}})
+
+    def test_minimal_and_unaligned_osds_keep_host_addresses(self):
+        plan = rp.build_plan(rp.PROFILE_MINIMAL, [osd(0, data_node=1)],
+                             host(networks=networks()))
+        self.assertEqual(self.addresses(plan), {'0': {}})
+        plan = rp.build_plan(rp.PROFILE_BALANCED, [osd(0, data_node=None)],
+                             host(networks=networks()))
+        self.assertEqual(self.addresses(plan), {'0': {}})
+
+    def test_missing_node_address(self):
+        three_nodes = {0: [0, 1], 1: [2, 3], 2: [4, 5]}
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(0, data_node=2)],
+                             host(nodes=three_nodes, networks=networks()))
+        self.assertEqual(plan.requests, [])
+        self.assertIn('no Ceph public network address on NUMA node 2',
+                      plan.errors[0])
+        plan = rp.build_plan(rp.PROFILE_BALANCED, [osd(0, data_node=2)],
+                             host(nodes=three_nodes, networks=networks()))
+        self.assertEqual(self.addresses(plan), {
+            '0': {'public': '10.0.0.5', 'cluster': '10.0.0.5'}})
+        self.assertIn('using host address 10.0.0.5', plan.deviations()[0])
+
+    def test_routing_problems(self):
+        crossed = nic('eth1', '10.0.1.5', [1],
+                      problems=['traffic is routed via eth0'])
+        facts = host(networks=networks(public=(ETH0, crossed)))
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(0, data_node=1)],
+                             facts)
+        self.assertIn('osd.0: Ceph public network address 10.0.1.5 on '
+                      'node 1: traffic is routed via eth0', plan.errors)
+        plan = rp.build_plan(rp.PROFILE_BALANCED, [osd(0, data_node=1)],
+                             facts)
+        self.assertEqual(self.addresses(plan)['0']['public'], '10.0.1.5')
+        self.assertEqual(len(plan.deviations()), 2)
+
+    def test_interfaces_spanning_nodes_serve_no_node(self):
+        bond = nic('bond0', '10.0.0.5', [0, 1])
+        facts = host(nic_nodes=(0, 1), interface='bond0',
+                     networks=networks(public=(bond, ETH1), default=bond))
+        self.assertEqual(rp.address_nodes(facts.networks[0]), {1})
+        self.assertFalse(rp.numa_addressing(facts.networks[0], facts))
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(0, data_node=1)],
+                             facts)
+        self.assertTrue(plan.satisfiable)
+        self.assertEqual(self.addresses(plan), {'0': {}})
+
+    def test_inactive_role_is_checked_strictly(self):
+        cluster0 = nic('eth2', '192.168.0.5', [0])
+        facts = host(networks=networks(cluster=(cluster0,),
+                                       cluster_default=cluster0))
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(0, data_node=1)],
+                             facts)
+        self.assertIn('Ceph cluster network interface eth2 is on node(s) 0',
+                      plan.errors[0])
+        plan = rp.build_plan(rp.PROFILE_BALANCED, [osd(0, data_node=1)],
+                             facts)
+        self.assertEqual(self.addresses(plan),
+                         {'0': {'public': '10.0.1.5'}})
+
+    def test_prefers_the_host_address_on_its_node(self):
+        other = nic('eth0', '10.0.0.4', [0])
+        facts = host(networks=networks(public=(other, ETH0, ETH1)))
+        plan = rp.build_plan(rp.PROFILE_BALANCED, [osd(0, data_node=0)],
+                             facts)
+        self.assertEqual(self.addresses(plan)['0']['public'], '10.0.0.5')
+        extra = nic('eth3', '10.0.1.4', [1])
+        facts = host(networks=networks(public=(ETH0, ETH1, extra)))
+        plan = rp.build_plan(rp.PROFILE_BALANCED, [osd(0, data_node=1)],
+                             facts)
+        self.assertEqual(self.addresses(plan)['0']['public'], '10.0.1.5')
+
+    def test_network_to_dict(self):
+        facts = host(networks=networks())
+        data = rp.network_to_dict(facts.networks[0], facts)
+        self.assertEqual(data, {
+            'role': 'public',
+            'source': 'config',
+            'default': {'interface': 'eth0', 'address': '10.0.0.5',
+                        'numa-nodes': [0], 'problems': []},
+            'candidates': [
+                {'interface': 'eth0', 'address': '10.0.0.5',
+                 'numa-nodes': [0], 'problems': []},
+                {'interface': 'eth1', 'address': '10.0.1.5',
+                 'numa-nodes': [1], 'problems': []},
+            ],
+            'numa-addressing': True,
+        })
+        self.assertIsNone(rp.nic_to_dict(None))
+
+
+class BindingTrustTestCase(unittest.TestCase):
+    """Per-node addresses from a Juju binding must pass the routing check."""
+
+    CROSSED = nic('eth1', '10.0.1.5', [1],
+                  problems=['traffic is routed via eth0'])
+
+    def binding(self, public=(ETH0, ETH1)):
+        return [rp.NetworkFacts(role, ETH0, tuple(public),
+                                rp.SOURCE_BINDING)
+                for role in rp.NETWORK_ROLES]
+
+    def addresses(self, plan):
+        return dict((r.osd_id, r.addresses) for r in plan.requests)
+
+    def test_clean_binding_binds_node_addresses(self):
+        facts = host(networks=self.binding())
+        self.assertFalse(rp.untrusted_binding(facts.networks[0], facts))
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(0, data_node=1)],
+                             facts)
+        self.assertTrue(plan.satisfiable, plan.errors)
+        self.assertEqual(self.addresses(plan), {
+            '0': {'public': '10.0.1.5', 'cluster': '10.0.1.5'}})
+        self.assertEqual(plan.warnings, [])
+
+    def test_misrouted_binding_keeps_the_host_address(self):
+        facts = host(networks=self.binding(public=(ETH0, self.CROSSED)))
+        self.assertTrue(rp.untrusted_binding(facts.networks[0], facts))
+        self.assertFalse(rp.numa_addressing(facts.networks[0], facts))
+        plan = rp.build_plan(rp.PROFILE_BALANCED, [osd(0, data_node=1)],
+                             facts)
+        self.assertEqual(self.addresses(plan), {'0': {}})
+        self.assertEqual(plan.deviations(), [])
+        self.assertEqual(len(plan.warnings), 2)
+        self.assertEqual(
+            plan.warnings[0],
+            'not binding OSDs to per-node addresses from the Juju public '
+            'binding, which fail the routing check (10.0.1.5: traffic is '
+            'routed via eth0); OSDs keep host address 10.0.0.5')
+        self.assertEqual(
+            rp.network_to_dict(facts.networks[0], facts)['numa-addressing'],
+            False)
+
+    def test_misrouted_binding_is_checked_strictly(self):
+        facts = host(networks=self.binding(public=(ETH0, self.CROSSED)))
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(0, data_node=1)],
+                             facts)
+        self.assertIn('Ceph network interface eth0 is on node(s) 0',
+                      plan.errors[0])
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(0, data_node=0)],
+                             facts)
+        self.assertTrue(plan.satisfiable, plan.errors)
+        self.assertEqual(self.addresses(plan), {'0': {}})
+
+    def test_configured_networks_keep_per_node_addresses(self):
+        configured = [rp.NetworkFacts(n.role, n.default, n.candidates)
+                      for n in self.binding(public=(ETH0, self.CROSSED))]
+        facts = host(networks=configured)
+        self.assertFalse(rp.untrusted_binding(configured[0], facts))
+        plan = rp.build_plan(rp.PROFILE_BALANCED, [osd(0, data_node=1)],
+                             facts)
+        self.assertEqual(self.addresses(plan)['0']['public'], '10.0.1.5')
+        self.assertEqual(plan.warnings, [])
+
+    def test_unaligned_candidates_do_not_affect_trust(self):
+        virtual = nic('br0', '10.0.2.5', [], problems=['routed via eth0'])
+        facts = host(networks=self.binding(public=(ETH0, ETH1, virtual)))
+        self.assertFalse(rp.untrusted_binding(facts.networks[0], facts))
+
+    def test_single_node_binding_needs_no_trust(self):
+        facts = host(networks=self.binding(public=(ETH0, nic(
+            'eth2', '10.0.2.5', [0], problems=['routed via eth1']))))
+        self.assertFalse(rp.untrusted_binding(facts.networks[0], facts))
+        plan = rp.build_plan(rp.PROFILE_BALANCED, [osd(0, data_node=0)],
+                             facts)
+        self.assertEqual(plan.warnings, [])
+
+    def test_minimal_does_not_warn(self):
+        facts = host(networks=self.binding(public=(ETH0, self.CROSSED)))
+        plan = rp.build_plan(rp.PROFILE_MINIMAL, [osd(0, data_node=1)],
+                             facts)
+        self.assertEqual(plan.warnings, [])

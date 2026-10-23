@@ -29,11 +29,13 @@ rolling-operation protocol before calculating, claiming or enforcing resources.
 """
 
 import collections
+import ipaddress
 import traceback
 
 from charmhelpers.core.hookenv import (
     config,
     log,
+    network_get,
     resource_get,
     DEBUG,
     ERROR,
@@ -59,26 +61,37 @@ from epa_client import (
 )
 from host_topology import (
     TopologyError,
+    arp_settings,
     device_is_rotational,
     device_numa_node,
     format_cpu_list,
     parse_cpu_list,
     interface_for_address,
     interface_numa_nodes,
+    local_addresses,
     numa_nodes,
     osd_device_map,
+    parse_ip,
+    route_interface,
 )
 from resource_profiles import (
     HostFacts,
     MODE_ANY,
     MODE_NUMA,
+    NetworkFacts,
+    Nic,
     OsdFacts,
     PROFILE_UNMANAGED,
     PROFILES,
+    ROLE_CLUSTER,
+    ROLE_PUBLIC,
+    SOURCE_BINDING,
+    SOURCE_CONFIG,
     build_plan,
     check_capacity,
     is_managed,
     is_strict,
+    network_to_dict,
     tier_for_rotational,
 )
 
@@ -168,6 +181,250 @@ def ceph_network_address():
     return utils.get_cluster_addr() or utils.get_public_addr()
 
 
+# Ceph network role, the charm option listing its networks, Juju binding.
+NETWORK_SOURCES = (
+    (ROLE_PUBLIC, 'ceph-public-network', 'public'),
+    (ROLE_CLUSTER, 'ceph-cluster-network', 'cluster'),
+)
+
+
+def _role_address(role):
+    """Return the host-wide address ceph.conf renders for a role."""
+    import utils
+    if role == ROLE_PUBLIC:
+        return utils.get_public_addr()
+    return utils.get_cluster_addr()
+
+
+def _parse_networks(cidrs):
+    """Parse CIDRs into unique networks, skipping invalid entries."""
+    networks = []
+    for cidr in cidrs:
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        if network not in networks:
+            networks.append(network)
+    return networks
+
+
+def _configured_networks(option):
+    """Return the networks listed in a charm option.
+
+    :rtype: list[ipaddress.IPv4Network or ipaddress.IPv6Network]
+    """
+    return _parse_networks((_config(option) or '').split())
+
+
+def _binding_networks(binding):
+    """Return the subnets of a Juju binding's space on this machine.
+
+    :rtype: list[ipaddress.IPv4Network or ipaddress.IPv6Network]
+    """
+    try:
+        info = network_get(binding) or {}
+    except Exception as exc:
+        log('Cannot query the {} binding: {}'.format(binding, exc),
+            level=DEBUG)
+        return []
+    cidrs = []
+    for bind in info.get('bind-addresses') or []:
+        for address in bind.get('addresses') or []:
+            if address.get('cidr'):
+                cidrs.append(address['cidr'])
+    return _parse_networks(cidrs)
+
+
+def _probe_destination(network, local):
+    """Pick a non-local address inside ``network`` for a route lookup.
+
+    At most ``len(local)`` usable addresses can be local, so trying one
+    more always finds a free one when the network has it.  None means
+    that no peer can be in the network.
+    """
+    size = network.num_addresses
+    if size == 1:
+        return None
+    # /31 and /127 point-to-point networks have no network or broadcast
+    # address.
+    first, last = (0, 1) if size == 2 else (1, size - 2)
+    for offset in range(first, min(last, first + len(local)) + 1):
+        candidate = network.network_address + offset
+        if candidate not in local:
+            return candidate
+    return None
+
+
+def _route_problems(nic, ip, networks, local, root, routes, warn):
+    """Find routes that send a candidate's traffic out of another node.
+
+    This is a heuristic: one routing table lookup per network.  A failed
+    lookup, or a candidate without any address to probe, is unverified
+    and reported as a problem rather than accepted.
+    """
+    problems = []
+    probed = False
+    for network in networks:
+        if network.version != ip.version:
+            continue
+        destination = _probe_destination(network, local)
+        if destination is None:
+            log('Not probing routes from {} to {}: every address in it is '
+                'local'.format(ip, network), level=DEBUG)
+            continue
+        probed = True
+        if (destination, ip) not in routes:
+            routes[(destination, ip)] = route_interface(destination, ip)
+        egress = routes[(destination, ip)]
+        if egress is None:
+            warn('Routing check: `ip route get {} from {}` found no route '
+                 'for {}'.format(destination, ip, network))
+            problems.append(
+                'cannot verify the route from {} to {}'.format(ip, network))
+            continue
+        if egress == nic.interface:
+            continue
+        egress_nodes = interface_numa_nodes(egress, root=root)
+        if egress_nodes != set(nic.nodes):
+            problems.append(
+                'traffic from {} to {} is routed via {} on NUMA node(s) '
+                '{}; add source-based routing for this address'.format(
+                    ip, network, egress,
+                    ','.join(str(n) for n in sorted(egress_nodes)) or
+                    'unknown'))
+    if not probed:
+        problem = (
+            'cannot verify the routes from {}: no remote address to probe '
+            'in {}'.format(ip, ', '.join(
+                str(n) for n in networks if n.version == ip.version)))
+        warn('Routing check: {}'.format(problem))
+        problems.append(problem)
+    return problems
+
+
+def _arp_problems(nic, subnet, shared, root):
+    """Require ARP flux protection on interfaces sharing an IPv4 subnet."""
+    if subnet.version != 4 or not shared:
+        return []
+    arp_ignore, arp_announce = arp_settings(nic.interface, root=root)
+    if (arp_ignore is not None and arp_ignore >= 1 and
+            arp_announce is not None and arp_announce >= 2):
+        return []
+    return [
+        'interface {} shares subnet {} with {}; set arp_ignore>=1 and '
+        'arp_announce>=2 (now {} and {})'.format(
+            nic.interface, subnet, ', '.join(sorted(shared)),
+            arp_ignore, arp_announce)]
+
+
+def collect_network_facts(root='/', addresses=None):
+    """Discover the candidate addresses for every Ceph network role.
+
+    A role's networks come from its charm option or, without one, from
+    the subnets of its Juju binding; the planner trusts per-node
+    addresses from a binding only when they pass the routing check.  A
+    candidate is a primary global address in the role's networks, of the
+    same family as the host-wide address.  When candidates serve more
+    than one NUMA node, each one is also checked for routes and ARP
+    behaviour that would carry its traffic through another node's
+    interface.
+
+    :rtype: list[resource_profiles.NetworkFacts]
+    """
+    if addresses is None:
+        addresses = local_addresses()
+    local = set(filter(None, (parse_ip(a['address']) for a in addresses)))
+    routes = {}
+    warned = set()
+
+    def warn(message):
+        # Both roles can probe the same candidates.
+        if message not in warned:
+            warned.add(message)
+            log(message, level=WARNING)
+
+    facts = []
+    defaults = {}
+    sources = {}
+    for role, option, binding in NETWORK_SOURCES:
+        try:
+            defaults[role] = parse_ip(_role_address(role) or '')
+        except Exception as exc:
+            log('Cannot determine the Ceph {} address: {}'.format(role, exc),
+                level=WARNING)
+            continue
+        # The charm option wins over the binding, as for the host address.
+        networks = _configured_networks(option)
+        if networks:
+            sources[role] = (networks, SOURCE_CONFIG)
+        elif (role == ROLE_CLUSTER and ROLE_PUBLIC in sources and
+                defaults[role] == defaults[ROLE_PUBLIC]):
+            # Without a separate cluster network, replication shares the
+            # public network and must follow the same per-node address.
+            sources[role] = sources[ROLE_PUBLIC]
+        else:
+            sources[role] = (_binding_networks(binding), SOURCE_BINDING)
+    for role, _, _ in NETWORK_SOURCES:
+        if role not in defaults:
+            continue
+        default_ip = defaults[role]
+        networks, source = sources[role]
+        entries = []
+        for entry in addresses:
+            ip = parse_ip(entry['address'])
+            if (ip is None or ip.is_loopback or ip.is_link_local or
+                    (default_ip is not None and
+                     ip.version != default_ip.version)):
+                continue
+            if ip != default_ip and (
+                    not entry.get('primary', True) or
+                    not any(ip in n for n in networks)):
+                # Secondary addresses (VIPs) and temporary IPv6 addresses
+                # do not identify an interface.
+                continue
+            subnet = ipaddress.ip_interface('{}/{}'.format(
+                ip, entry.get('prefixlen') or ip.max_prefixlen)).network
+            nic = Nic(interface=entry['interface'], address=str(ip),
+                      nodes=frozenset(interface_numa_nodes(
+                          entry['interface'], root=root)),
+                      problems=())
+            entries.append((nic, ip, subnet))
+        nics = [nic for nic, _, _ in entries]
+        served = set(next(iter(n.nodes)) for n in nics if len(n.nodes) == 1)
+        if len(served) > 1:
+            probes = list(networks)
+            for _, _, subnet in entries:
+                if subnet not in probes:
+                    probes.append(subnet)
+            checked = []
+            for nic, ip, subnet in entries:
+                shared = set(
+                    other.interface for other, _, other_subnet in entries
+                    if other_subnet == subnet and
+                    other.interface != nic.interface)
+                problems = (
+                    _route_problems(nic, ip, probes, local, root, routes,
+                                    warn) +
+                    _arp_problems(nic, subnet, shared, root))
+                checked.append(nic._replace(problems=tuple(problems)))
+            nics = checked
+        default = None
+        for nic in nics:
+            if default_ip is not None and parse_ip(nic.address) == default_ip:
+                default = nic
+        if default is None and default_ip is not None:
+            interface = interface_for_address(str(default_ip))
+            default = Nic(
+                interface=interface, address=str(default_ip),
+                nodes=frozenset(interface_numa_nodes(interface, root=root)
+                                if interface else ()),
+                problems=())
+        facts.append(NetworkFacts(role=role, default=default,
+                                  candidates=tuple(nics), source=source))
+    return facts
+
+
 def collect_host_facts(root='/'):
     """Discover NUMA topology and Ceph network interface locality.
 
@@ -186,8 +443,11 @@ def collect_host_facts(root='/'):
         interface = interface_for_address(address)
     if interface:
         nic_nodes = interface_numa_nodes(interface, root=root)
+    networks = ()
+    if len(nodes) > 1:
+        networks = tuple(collect_network_facts(root=root))
     return HostFacts(nodes=nodes, nic_interface=interface,
-                     nic_nodes=nic_nodes)
+                     nic_nodes=nic_nodes, networks=networks)
 
 
 def collect_osd_facts(root='/'):
@@ -740,7 +1000,7 @@ def _allocate_flexible(client, plan, previous_osds, state, osds, profile):
 def _allocation(request, cores, mode, numa_node):
     """Build the record describing one OSD's granted allocation."""
     policy = request.numa_policy if mode == MODE_NUMA else None
-    return {
+    allocation = {
         'osd-id': request.osd_id,
         'tier': request.tier,
         'mode': mode,
@@ -751,6 +1011,9 @@ def _allocation(request, cores, mode, numa_node):
         'count': len(cores),
         'deviations': list(request.deviations),
     }
+    if request.addresses:
+        allocation['addresses'] = dict(request.addresses)
+    return allocation
 
 
 def _pool_demand(plan, host, listing, own_services):
@@ -1109,17 +1372,17 @@ def verify(client_factory=EpaClient):
 
     claims = allocations_by_service(listing or {})
     for osd_id, record in sorted(osds.items()):
-        expected = resource_apply.render_dropin(
-            record.get('profile', profile), record.get('cores'),
-            numa_policy=record.get('numa-policy'),
-            numa_node=record.get('numa-node'))
+        expected = resource_apply.render_allocation(
+            record.get('profile', profile), record)
         if resource_apply.read_dropin(osd_id) != expected:
             drift.append(
                 'osd.{}: CPU affinity drop-in differs from the applied '
                 'allocation'.format(osd_id))
         else:
             try:
-                resource_apply.verify_enforcement(osd_id, record.get('cores'))
+                resource_apply.verify_enforcement(
+                    osd_id, record.get('cores'),
+                    addresses=record.get('addresses'))
             except resource_apply.ApplyError as exc:
                 drift.append(str(exc))
         if listing is None:
@@ -1353,6 +1616,9 @@ def status_report(dry_run=None, client_factory=EpaClient):
         'interface': host.nic_interface,
         'numa-nodes': sorted(host.nic_nodes),
     }
+    if host.networks:
+        report['networks'] = [network_to_dict(network, host)
+                              for network in host.networks]
 
     profile = dry_run or report['requested-profile']
     plan = None
@@ -1360,7 +1626,7 @@ def status_report(dry_run=None, client_factory=EpaClient):
         plan = build_plan(profile, osds, host)
         if dry_run:
             report['errors'] = list(plan.errors)
-            report['warnings'] = plan.deviations()
+            report['warnings'] = list(plan.warnings) + plan.deviations()
             free = set(eligible_cpus(listing or {}))
             own = set(service_name_for(o.osd_id) for o in osds)
             for name, entry in claims.items():
@@ -1383,8 +1649,10 @@ def status_report(dry_run=None, client_factory=EpaClient):
             'desired-cores': request.cores if request else None,
             'desired-mode': request.mode if request else None,
             'desired-numa-node': request.numa_node if request else None,
+            'desired-addresses': dict(request.addresses) if request else None,
             'applied-cores': record.get('cores'),
             'applied-numa-policy': record.get('numa-policy'),
+            'applied-addresses': dict(record.get('addresses') or {}),
             'allocator-cores': format_cpu_list(claim.get('cores') or []),
             'allocator-policy': claim.get('preemption_policy'),
             'deviations': (list(request.deviations) if request
@@ -1399,9 +1667,13 @@ def _rollout_inputs():
         return {}
     try:
         host = collect_host_facts()
-        return {'osds': [o._asdict() for o in collect_osd_facts()],
-                'nodes': host.nodes, 'interface': host.nic_interface,
-                'nic-nodes': sorted(host.nic_nodes)}
+        inputs = {'osds': [o._asdict() for o in collect_osd_facts()],
+                  'nodes': host.nodes, 'interface': host.nic_interface,
+                  'nic-nodes': sorted(host.nic_nodes)}
+        if host.networks:
+            inputs['networks'] = [network_to_dict(network, host)
+                                  for network in host.networks]
+        return inputs
     except TopologyError as exc:
         # Publish a request even when discovery fails, so an unhealthy unit
         # cannot silently disappear from the cohort. Reconcile records it.

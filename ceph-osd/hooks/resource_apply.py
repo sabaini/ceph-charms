@@ -25,9 +25,11 @@ affinity must be disabled while an allocation is applied; otherwise it can
 widen the process affinity after systemd has started the daemon.
 """
 
+import ipaddress
 import json
 import os
 import subprocess
+import sys
 import time
 
 from charmhelpers.core.hookenv import (
@@ -42,10 +44,12 @@ from charmhelpers.core.unitdata import kv
 from host_topology import (
     format_cpu_list,
     parse_cpu_list,
+    parse_ip,
 )
 
 DROPIN_DIR = '/etc/systemd/system/ceph-osd@{osd_id}.service.d'
 DROPIN_NAME = '50-charm-resource-profile.conf'
+ADDRESS_ROLES = ('public', 'cluster')
 PENDING_KEY = 'resource-alloc.pending-restarts'
 CLEAR_PENDING_KEY = 'resource-alloc.pending-clears'
 
@@ -105,6 +109,9 @@ READY_STATE = 'active'
 RESTART_TIMEOUT = 300
 RESTART_POLL_INTERVAL = 5
 
+# TCP_LISTEN in /proc/net/tcp{,6}.
+LISTEN_STATE = '0A'
+
 
 class ApplyError(Exception):
     """Raised when an allocation could not be enforced."""
@@ -123,7 +130,21 @@ def _application_name():
         return 'ceph-osd'
 
 
-def render_dropin(profile, cores, numa_policy=None, numa_node=None):
+def _ceph_args(addresses):
+    """Command line options binding an OSD to per-role addresses."""
+    args = []
+    for role in ADDRESS_ROLES:
+        if addresses.get(role):
+            args.extend(['--{}-addr'.format(role), str(addresses[role])])
+    if args:
+        # Bind outgoing connections too; otherwise the kernel chooses the
+        # source address, and with it possibly another node's interface.
+        args.extend(['--ms-bind-before-connect', 'true'])
+    return ' '.join(args)
+
+
+def render_dropin(profile, cores, numa_policy=None, numa_node=None,
+                  addresses=None):
     """Render the systemd drop-in enforcing one OSD's allocation.
 
     :param profile: active profile name, recorded as a comment
@@ -135,6 +156,9 @@ def render_dropin(profile, cores, numa_policy=None, numa_node=None):
     :type numa_policy: str or None
     :param numa_node: NUMA node for NUMAMask, or None to omit
     :type numa_node: int or None
+    :param addresses: Ceph network role (``public``/``cluster``) to the
+        address the OSD binds, or None for the host-wide ceph.conf ones
+    :type addresses: dict or None
     :rtype: str
     """
     if isinstance(cores, str):
@@ -145,6 +169,11 @@ def render_dropin(profile, cores, numa_policy=None, numa_node=None):
     lines.append(
         'Environment="CEPH_CONF=/var/lib/charm/{}/ceph.conf"\n'.format(
             _application_name()))
+    ceph_args = _ceph_args(addresses or {})
+    if ceph_args:
+        # Ceph parses CEPH_ARGS as command line options, which take
+        # precedence over the host-wide addresses in ceph.conf.
+        lines.append('Environment="CEPH_ARGS={}"\n'.format(ceph_args))
     # systemd merges list assignments across the unit and its drop-ins; an
     # empty assignment discards any mask set before this drop-in.
     lines.append('CPUAffinity=\n')
@@ -154,6 +183,16 @@ def render_dropin(profile, cores, numa_policy=None, numa_node=None):
         lines.append('NUMAMask=\n')
         lines.append('NUMAMask={}\n'.format(numa_node))
     return ''.join(lines)
+
+
+def render_allocation(profile, allocation):
+    """Render the drop-in for an allocation or applied-allocation record."""
+    return render_dropin(
+        profile,
+        allocation['cores'],
+        numa_policy=allocation.get('numa-policy'),
+        numa_node=allocation.get('numa-node'),
+        addresses=allocation.get('addresses'))
 
 
 def read_dropin(osd_id):
@@ -263,8 +302,108 @@ def _daemon_config_value(osd_id, option):
         return None
 
 
-def verify_enforcement(osd_id, cores):
-    """Raise when Ceph did not retain the CPU boundary after restart."""
+def _entity_address(value):
+    """Extract the IP from a Ceph address such as ``v2:10.0.0.1:0/0``.
+
+    :rtype: ipaddress.IPv4Address or ipaddress.IPv6Address or None
+    """
+    if not value or value == '-':
+        return None
+    for prefix in ('v1:', 'v2:', 'any:'):
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+            break
+    value = value.split('/', 1)[0]
+    if value.startswith('['):
+        value = value[1:].split(']', 1)[0]
+    elif value.count(':') == 1:
+        value = value.split(':', 1)[0]
+    return parse_ip(value)
+
+
+def _proc_ip(hexaddr):
+    """Decode an address from ``/proc/net/tcp{,6}``.
+
+    The kernel prints each 32-bit word of the network-order address in
+    host byte order.
+    """
+    raw = bytes.fromhex(hexaddr)
+    if sys.byteorder == 'little':
+        raw = b''.join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))
+    address = ipaddress.ip_address(raw)
+    if address.version == 6 and address.ipv4_mapped:
+        return address.ipv4_mapped
+    return address
+
+
+def _listening_addresses(pid, proc_root='/proc'):
+    """Return the IP addresses a process has TCP listening sockets on.
+
+    :returns: set of addresses, or None when the process is unreadable
+    :rtype: set or None
+    """
+    fd_dir = os.path.join(proc_root, str(pid), 'fd')
+    inodes = set()
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        return None
+    for name in names:
+        try:
+            target = os.readlink(os.path.join(fd_dir, name))
+        except OSError:
+            continue
+        if target.startswith('socket:['):
+            inodes.add(target[len('socket:['):-1])
+    addresses = set()
+    for table in ('tcp', 'tcp6'):
+        try:
+            with open(os.path.join(proc_root, str(pid), 'net', table)) as f:
+                lines = f.read().splitlines()[1:]
+        except (IOError, OSError):
+            continue
+        for line in lines:
+            fields = line.split()
+            # sl local rem st tx:rx tr:when retrnsmt uid timeout inode
+            if (len(fields) < 10 or fields[3] != LISTEN_STATE or
+                    fields[9] not in inodes):
+                continue
+            try:
+                addresses.add(_proc_ip(fields[1].split(':')[0]))
+            except ValueError:
+                continue
+    return addresses
+
+
+def _verify_addresses(osd_id, pid, addresses):
+    """Raise unless the OSD uses and listens on its per-role addresses."""
+    if _daemon_config_value(osd_id, 'ms_bind_before_connect') not in (
+            'true', '1'):
+        raise ApplyError(
+            'osd.{} does not bind outgoing connections to its network '
+            'addresses (ms_bind_before_connect)'.format(osd_id))
+    listening = _listening_addresses(pid) if pid else None
+    if listening is None:
+        raise ApplyError(
+            'cannot read listening sockets for osd.{}'.format(osd_id))
+    for role in ADDRESS_ROLES:
+        wanted = parse_ip(addresses.get(role) or '')
+        if wanted is None:
+            continue
+        option = '{}_addr'.format(role)
+        actual = _entity_address(_daemon_config_value(osd_id, option))
+        if actual != wanted:
+            raise ApplyError(
+                'osd.{} uses {} {} instead of {}'.format(
+                    osd_id, option, actual or 'unknown', wanted))
+        if wanted not in listening:
+            raise ApplyError(
+                'osd.{} is not listening on its {} network address '
+                '{}'.format(osd_id, role, wanted))
+
+
+def verify_enforcement(osd_id, cores, addresses=None):
+    """Raise when Ceph did not retain the CPU or address binding."""
     auto = _daemon_config_value(osd_id, 'osd_numa_auto_affinity')
     node = _daemon_config_value(osd_id, 'osd_numa_node')
     if auto not in ('false', '0') or node != '-1':
@@ -292,6 +431,8 @@ def verify_enforcement(osd_id, cores):
         raise ApplyError(
             'osd.{} thread affinity escapes {} (threads: {})'.format(
                 osd_id, expected, ', '.join(sorted(mismatched))))
+    if addresses:
+        _verify_addresses(osd_id, pid, addresses)
 
 
 def _osd_state(osd_id):
@@ -369,7 +510,8 @@ def apply_allocations(profile, allocations, restart_timeout=RESTART_TIMEOUT,
     :param profile: active profile name
     :type profile: str
     :param allocations: per-OSD allocation dicts, each with ``osd-id``,
-        ``cores``, ``numa-policy`` and ``numa-node`` keys
+        ``cores``, ``numa-policy`` and ``numa-node`` keys, and optionally
+        ``addresses``
     :type allocations: list[dict]
     :param force_osd_ids: OSD IDs requiring restart even with matching bytes
     :type force_osd_ids: iterable[str]
@@ -385,11 +527,7 @@ def apply_allocations(profile, allocations, restart_timeout=RESTART_TIMEOUT,
         (str(allocation['osd-id']), allocation) for allocation in allocations)
     for allocation in allocations:
         osd_id = str(allocation['osd-id'])
-        content = render_dropin(
-            profile,
-            allocation['cores'],
-            numa_policy=allocation.get('numa-policy'),
-            numa_node=allocation.get('numa-node'))
+        content = render_allocation(profile, allocation)
         if (read_dropin(osd_id) != content or
                 osd_id in pending_restarts() or osd_id in force_osd_ids):
             # Persist before writing: a failed restart or interrupted hook
@@ -402,13 +540,16 @@ def apply_allocations(profile, allocations, restart_timeout=RESTART_TIMEOUT,
         if verify_unchanged:
             for allocation in allocations:
                 verify_enforcement(
-                    allocation['osd-id'], allocation['cores'])
+                    allocation['osd-id'], allocation['cores'],
+                    addresses=allocation.get('addresses'))
         return []
     daemon_reload()
     restarted = []
     for osd_id in changed:
         restart_osd(osd_id, timeout=restart_timeout)
-        verify_enforcement(osd_id, allocation_by_id[osd_id]['cores'])
+        verify_enforcement(osd_id, allocation_by_id[osd_id]['cores'],
+                           addresses=allocation_by_id[osd_id].get(
+                               'addresses'))
         _pending(osd_id, False)
         restarted.append(osd_id)
     return restarted

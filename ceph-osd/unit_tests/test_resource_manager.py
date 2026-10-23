@@ -271,13 +271,14 @@ class ManagerTestCase(unittest.TestCase):
         return [a['osd-id'] for a in allocations]
 
     def reconcile(self, profile, osds, epa, nodes=None, nic_nodes=(0,),
-                  interface='eth0'):
+                  interface='eth0', networks=()):
         """Run a reconcile against fixed host facts."""
         self.config['performance-profile'] = profile
         self.epa = epa
         host = rp.HostFacts(nodes=nodes or TWO_NODES,
                             nic_interface=interface,
-                            nic_nodes=set(nic_nodes))
+                            nic_nodes=set(nic_nodes),
+                            networks=tuple(networks))
         with patch.object(resource_manager, 'collect_osd_facts',
                           return_value=osds), \
                 patch.object(resource_manager, 'collect_host_facts',
@@ -2103,13 +2104,16 @@ class CollectorTestCase(ManagerTestCase):
         self.assertEqual(facts[1].data_node, 0)
 
     def test_collect_host_facts(self):
+        network = rp.NetworkFacts('public', None, ())
         with patch.object(resource_manager, 'numa_nodes') as nodes, \
                 patch.object(resource_manager, 'ceph_network_address',
                              return_value='10.0.0.5'), \
                 patch.object(resource_manager,
                              'interface_for_address') as lookup, \
                 patch.object(resource_manager,
-                             'interface_numa_nodes') as nic_nodes:
+                             'interface_numa_nodes') as nic_nodes, \
+                patch.object(resource_manager, 'collect_network_facts',
+                             return_value=[network]) as networks:
             nodes.return_value = TWO_NODES
             lookup.return_value = 'bond0'
             nic_nodes.return_value = set([1])
@@ -2117,6 +2121,19 @@ class CollectorTestCase(ManagerTestCase):
         self.assertEqual(facts.nodes, TWO_NODES)
         self.assertEqual(facts.nic_interface, 'bond0')
         self.assertEqual(facts.nic_nodes, set([1]))
+        self.assertEqual(facts.networks, (network,))
+        networks.assert_called_once_with(root='/')
+
+    def test_collect_host_facts_single_node_skips_networks(self):
+        with patch.object(resource_manager, 'numa_nodes') as nodes, \
+                patch.object(resource_manager, 'ceph_network_address',
+                             return_value=None), \
+                patch.object(resource_manager,
+                             'collect_network_facts') as networks:
+            nodes.return_value = {0: [0, 1]}
+            facts = resource_manager.collect_host_facts()
+        self.assertEqual(facts.networks, ())
+        networks.assert_not_called()
 
     def test_collect_host_facts_without_an_interface(self):
         with patch.object(resource_manager, 'numa_nodes') as nodes, \
@@ -2138,3 +2155,435 @@ class CollectorTestCase(ManagerTestCase):
             facts = resource_manager.collect_host_facts()
         self.assertEqual(facts.nic_nodes, set())
         self.assertIsNone(facts.nic_interface)
+
+
+def nic(interface, address, nodes, problems=()):
+    return rp.Nic(interface=interface, address=address,
+                  nodes=frozenset(nodes), problems=tuple(problems))
+
+
+def per_node_networks():
+    """Public and cluster traffic on one address per NUMA node."""
+    eth0 = nic('eth0', '10.0.0.5', [0])
+    eth1 = nic('eth1', '10.0.1.5', [1])
+    return [rp.NetworkFacts(role, eth0, (eth0, eth1))
+            for role in rp.NETWORK_ROLES]
+
+
+ADDRESSES = [
+    {'interface': 'lo', 'address': '127.0.0.1', 'prefixlen': 8,
+     'primary': True},
+    {'interface': 'eth0', 'address': '10.0.0.5', 'prefixlen': 24,
+     'primary': True},
+    {'interface': 'eth0', 'address': 'fe80::1', 'prefixlen': 64,
+     'primary': True},
+    {'interface': 'eth1', 'address': '10.0.1.5', 'prefixlen': 24,
+     'primary': True},
+    {'interface': 'eth1', 'address': '10.0.1.9', 'prefixlen': 24,
+     'primary': False},
+    {'interface': 'eth1', 'address': '2001:db8::5', 'prefixlen': 64,
+     'primary': True},
+    {'interface': 'eth2', 'address': '192.168.7.5', 'prefixlen': 24,
+     'primary': True},
+]
+
+NIC_NODES = {'eth0': {0}, 'eth1': {1}, 'eth2': {1}, 'eth3': {0}}
+
+
+class NetworkFactsTestCase(ManagerTestCase):
+
+    def setUp(self):
+        super(NetworkFactsTestCase, self).setUp()
+        self.role_addresses = {'public': '10.0.0.5', 'cluster': '10.0.0.5'}
+        self.config['ceph-public-network'] = '10.0.0.0/24 10.0.1.0/24'
+        self.routes = []
+        self.egress = lambda destination, source: (
+            'eth0' if str(source).startswith('10.0.0.') else 'eth1')
+        self.arp = (0, 0)
+        self.bindings = {}
+        self.logged = []
+        for name, replacement in (
+                ('log', lambda message, level=None: self.logged.append(
+                    (level, message))),
+                ('_role_address', lambda role: self.role_addresses[role]),
+                ('network_get', self._network_get),
+                ('interface_numa_nodes',
+                 lambda interface, root='/': set(
+                     NIC_NODES.get(interface, ()))),
+                ('route_interface', self._route),
+                ('arp_settings', lambda interface, root='/': self.arp),
+                ('interface_for_address', lambda address: None)):
+            patcher = patch.object(resource_manager, name, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _route(self, destination, source):
+        self.routes.append((str(destination), str(source)))
+        return self.egress(destination, source)
+
+    def _network_get(self, binding):
+        value = self.bindings.get(binding, {})
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def bind(self, binding, *cidrs):
+        self.bindings[binding] = {'bind-addresses': [
+            {'interface-name': 'eth{}'.format(i), 'addresses': [
+                {'value': 'ignored', 'cidr': cidr}]}
+            for i, cidr in enumerate(cidrs)]}
+
+    def facts(self, addresses=ADDRESSES):
+        return dict((n.role, n) for n in
+                    resource_manager.collect_network_facts(
+                        addresses=addresses))
+
+    def test_finds_one_primary_address_per_node(self):
+        facts = self.facts()
+        public = facts['public']
+        self.assertEqual(public.default.address, '10.0.0.5')
+        self.assertEqual(
+            [(n.interface, n.address, sorted(n.nodes), n.problems)
+             for n in public.candidates],
+            [('eth0', '10.0.0.5', [0], ()), ('eth1', '10.0.1.5', [1], ())])
+        # Without a cluster network, replication follows the public one.
+        self.assertEqual(facts['cluster'].candidates, public.candidates)
+        # Lookups are shared between the two roles.
+        self.assertEqual(len(self.routes), len(set(self.routes)))
+        self.assertIn(('10.0.0.1', '10.0.1.5'), self.routes)
+
+    def test_reports_routes_through_another_node(self):
+        self.egress = lambda destination, source: 'eth0'
+        public = self.facts()['public']
+        eth0, eth1 = public.candidates
+        self.assertEqual(eth0.problems, ())
+        self.assertEqual(len(eth1.problems), 2)
+        self.assertIn('traffic from 10.0.1.5 to 10.0.0.0/24 is routed via '
+                      'eth0 on NUMA node(s) 0', eth1.problems[0])
+        self.assertIn('traffic from 10.0.1.5 to 10.0.1.0/24 is routed via '
+                      'eth0', eth1.problems[1])
+
+    def test_reports_unverifiable_routes(self):
+        self.egress = lambda destination, source: None
+        eth0, eth1 = self.facts()['public'].candidates
+        self.assertIn('cannot verify the route from 10.0.1.5 to '
+                      '10.0.0.0/24', eth1.problems)
+        self.assertIn(
+            ('WARNING', 'Routing check: `ip route get 10.0.0.1 from '
+             '10.0.1.5` found no route for 10.0.0.0/24'), self.logged)
+        # Both roles probe the same candidates; each failure is logged once.
+        warnings = [m for level, m in self.logged if level == 'WARNING']
+        self.assertEqual(len(warnings), len(set(warnings)))
+
+    def test_probe_destination_skips_local_addresses(self):
+        probe = resource_manager._probe_destination
+        net = resource_manager.ipaddress.ip_network
+        ip = resource_manager.ipaddress.ip_address
+        local = {ip('10.0.0.1'), ip('10.0.0.2'), ip('10.0.0.254')}
+        self.assertEqual(probe(net('10.0.0.0/24'), local), ip('10.0.0.3'))
+        self.assertEqual(probe(net('10.0.0.0/30'), {ip('10.0.0.1')}),
+                         ip('10.0.0.2'))
+        self.assertEqual(probe(net('2001:db8::/64'), {ip('2001:db8::1')}),
+                         ip('2001:db8::2'))
+        # Both ends of a point-to-point network are usable.
+        self.assertEqual(probe(net('10.0.0.0/31'), {ip('10.0.0.0')}),
+                         ip('10.0.0.1'))
+        self.assertEqual(probe(net('2001:db8::/127'), {ip('2001:db8::1')}),
+                         ip('2001:db8::'))
+        # No peer can be in a network whose addresses are all local.
+        self.assertIsNone(probe(net('10.0.0.0/31'),
+                                {ip('10.0.0.0'), ip('10.0.0.1')}))
+        self.assertIsNone(probe(net('10.0.0.5/32'), set()))
+
+    def occupied_offsets(self):
+        """Candidates holding the first, second and last host address."""
+        self.role_addresses = {'public': '10.0.0.1', 'cluster': '10.0.0.1'}
+        self.arp = (1, 2)
+        self.egress = lambda destination, source: 'eth0'
+        return [
+            {'interface': 'eth0', 'address': '10.0.0.1', 'prefixlen': 24,
+             'primary': True},
+            {'interface': 'eth1', 'address': '10.0.0.2', 'prefixlen': 24,
+             'primary': True},
+            {'interface': 'eth0', 'address': '10.0.0.254', 'prefixlen': 24,
+             'primary': False},
+        ]
+
+    def plan(self, profile, addresses):
+        networks = tuple(resource_manager.collect_network_facts(
+            addresses=addresses))
+        host = rp.HostFacts(nodes=TWO_NODES, nic_interface='eth0',
+                            nic_nodes={0}, networks=networks)
+        return rp.build_plan(profile, [osd(0, node=1)], host)
+
+    def test_occupied_probe_offsets_are_still_probed(self):
+        self.config['ceph-public-network'] = '10.0.0.0/24'
+        eth0, eth1 = self.facts(self.occupied_offsets())['public'].candidates
+        self.assertEqual(self.routes, [('10.0.0.3', '10.0.0.1'),
+                                       ('10.0.0.3', '10.0.0.2')])
+        self.assertEqual(eth0.problems, ())
+        self.assertEqual(eth1.problems, (
+            'traffic from 10.0.0.2 to 10.0.0.0/24 is routed via eth0 on '
+            'NUMA node(s) 0; add source-based routing for this address',))
+
+    def test_occupied_probe_offsets_reject_a_configured_network(self):
+        self.config['ceph-public-network'] = '10.0.0.0/24'
+        plan = self.plan(rp.PROFILE_PERFORMANCE, self.occupied_offsets())
+        self.assertFalse(plan.satisfiable)
+        self.assertIn('osd.0: Ceph public network address 10.0.0.2 on node '
+                      '1: traffic from 10.0.0.2 to 10.0.0.0/24 is routed '
+                      'via eth0', ' '.join(plan.errors))
+
+    def test_occupied_probe_offsets_distrust_a_binding(self):
+        self.config['ceph-public-network'] = None
+        self.bind('public', '10.0.0.0/24')
+        addresses = self.occupied_offsets()
+        plan = self.plan(rp.PROFILE_BALANCED, addresses)
+        self.assertEqual(plan.requests[0].addresses, {})
+        self.assertIn('not binding OSDs to per-node addresses from the Juju '
+                      'public binding', plan.warnings[0])
+        plan = self.plan(rp.PROFILE_PERFORMANCE, addresses)
+        self.assertFalse(plan.satisfiable)
+
+    def test_point_to_point_candidates_are_probed(self):
+        self.config['ceph-public-network'] = '10.0.0.0/31 10.0.0.2/31'
+        self.role_addresses = {'public': '10.0.0.0', 'cluster': '10.0.0.0'}
+        self.egress = lambda destination, source: (
+            'eth0' if str(source) == '10.0.0.0' else 'eth1')
+        addresses = [
+            {'interface': 'eth0', 'address': '10.0.0.0', 'prefixlen': 31,
+             'primary': True},
+            {'interface': 'eth1', 'address': '10.0.0.2', 'prefixlen': 31,
+             'primary': True},
+        ]
+        eth0, eth1 = self.facts(addresses)['public'].candidates
+        self.assertEqual(sorted(self.routes), [
+            ('10.0.0.1', '10.0.0.0'), ('10.0.0.1', '10.0.0.2'),
+            ('10.0.0.3', '10.0.0.0'), ('10.0.0.3', '10.0.0.2')])
+        self.assertEqual((eth0.problems, eth1.problems), ((), ()))
+
+    def test_candidates_without_a_probe_destination_are_unverified(self):
+        self.config['ceph-public-network'] = '10.0.0.5/32 10.0.1.5/32'
+        addresses = [
+            {'interface': 'eth0', 'address': '10.0.0.5', 'prefixlen': 32,
+             'primary': True},
+            {'interface': 'eth1', 'address': '10.0.1.5', 'prefixlen': 32,
+             'primary': True},
+        ]
+        eth0, eth1 = self.facts(addresses)['public'].candidates
+        self.assertEqual(self.routes, [])
+        problem = ('cannot verify the routes from 10.0.1.5: no remote '
+                   'address to probe in 10.0.0.5/32, 10.0.1.5/32')
+        self.assertEqual(eth1.problems, (problem,))
+        self.assertIn(('WARNING', 'Routing check: ' + problem), self.logged)
+
+    def test_routes_via_another_interface_on_the_same_node(self):
+        self.egress = lambda destination, source: 'eth3'
+        eth0, eth1 = self.facts()['public'].candidates
+        self.assertEqual(eth0.problems, ())
+        self.assertTrue(eth1.problems)
+
+    def test_shared_subnet_requires_arp_flux_protection(self):
+        addresses = [
+            {'interface': 'eth0', 'address': '10.0.0.5', 'prefixlen': 24,
+             'primary': True},
+            {'interface': 'eth1', 'address': '10.0.0.6', 'prefixlen': 24,
+             'primary': True},
+        ]
+        self.egress = lambda destination, source: (
+            'eth0' if str(source) == '10.0.0.5' else 'eth1')
+        eth0, eth1 = self.facts(addresses)['public'].candidates
+        self.assertIn('interface eth1 shares subnet 10.0.0.0/24 with eth0; '
+                      'set arp_ignore>=1 and arp_announce>=2 (now 0 and 0)',
+                      eth1.problems)
+        self.arp = (1, 2)
+        eth0, eth1 = self.facts(addresses)['public'].candidates
+        self.assertEqual((eth0.problems, eth1.problems), ((), ()))
+
+    def test_single_node_candidates_are_not_probed(self):
+        self.config['ceph-public-network'] = '10.0.0.0/24'
+        facts = self.facts()
+        self.assertEqual([n.address for n in facts['public'].candidates],
+                         ['10.0.0.5'])
+        self.assertEqual(self.routes, [])
+
+    def test_without_networks_or_binding_only_the_host_address(self):
+        self.config['ceph-public-network'] = None
+        facts = self.facts()
+        self.assertEqual(
+            [n.address for n in facts['public'].candidates], ['10.0.0.5'])
+        self.assertEqual(
+            [n.address for n in facts['cluster'].candidates], ['10.0.0.5'])
+        self.assertEqual(facts['public'].source, rp.SOURCE_BINDING)
+
+    def test_configured_networks_win_over_the_binding(self):
+        self.bind('public', '192.168.7.0/24')
+        facts = self.facts()
+        self.assertEqual(facts['public'].source, rp.SOURCE_CONFIG)
+        self.assertEqual([n.address for n in facts['public'].candidates],
+                         ['10.0.0.5', '10.0.1.5'])
+
+    def test_binding_subnets_without_configured_networks(self):
+        self.config['ceph-public-network'] = None
+        self.bind('public', '10.0.0.0/24', '10.0.1.0/24', '10.0.1.0/24')
+        facts = self.facts()
+        public = facts['public']
+        self.assertEqual(public.source, rp.SOURCE_BINDING)
+        self.assertEqual([n.address for n in public.candidates],
+                         ['10.0.0.5', '10.0.1.5'])
+        self.assertEqual([n.problems for n in public.candidates], [(), ()])
+        # Replication follows the public binding when it shares the address.
+        self.assertEqual(facts['cluster'], public._replace(role='cluster'))
+
+    def test_cluster_uses_its_own_binding_for_a_distinct_address(self):
+        self.config['ceph-public-network'] = None
+        self.role_addresses['cluster'] = '192.168.7.5'
+        self.bind('public', '10.0.0.0/24', '10.0.1.0/24')
+        self.bind('cluster', '192.168.7.0/24')
+        facts = self.facts()
+        self.assertEqual(facts['cluster'].source, rp.SOURCE_BINDING)
+        self.assertEqual([n.address for n in facts['cluster'].candidates],
+                         ['192.168.7.5'])
+
+    def test_failed_binding_query_keeps_the_host_address(self):
+        self.config['ceph-public-network'] = None
+        self.bindings['public'] = RuntimeError('network-get failed')
+        facts = self.facts()
+        self.assertEqual([n.address for n in facts['public'].candidates],
+                         ['10.0.0.5'])
+
+    def test_separate_cluster_network(self):
+        self.config['ceph-cluster-network'] = '192.168.7.0/24'
+        self.role_addresses['cluster'] = '192.168.7.5'
+        facts = self.facts()
+        self.assertEqual(facts['cluster'].default.address, '192.168.7.5')
+        self.assertEqual(
+            [n.address for n in facts['cluster'].candidates],
+            ['192.168.7.5'])
+
+    def test_distinct_cluster_address_does_not_follow_public(self):
+        self.role_addresses['cluster'] = '192.168.7.5'
+        facts = self.facts()
+        self.assertEqual(
+            [n.address for n in facts['cluster'].candidates],
+            ['192.168.7.5'])
+
+    def test_ipv6_candidates_follow_the_host_address_family(self):
+        self.config['ceph-public-network'] = '2001:db8::/64'
+        self.role_addresses = {'public': '2001:db8::5',
+                               'cluster': '2001:db8::5'}
+        facts = self.facts()
+        self.assertEqual(
+            [n.address for n in facts['public'].candidates],
+            ['2001:db8::5'])
+
+    def test_unknown_host_address_skips_the_role(self):
+        def failing(role):
+            raise RuntimeError('no network binding')
+        with patch.object(resource_manager, '_role_address', failing):
+            self.assertEqual(
+                resource_manager.collect_network_facts(addresses=ADDRESSES),
+                [])
+
+    def test_host_address_outside_candidates(self):
+        self.role_addresses = {'public': '10.9.9.9', 'cluster': '10.9.9.9'}
+        public = self.facts()['public']
+        self.assertEqual(public.default,
+                         nic(None, '10.9.9.9', []))
+
+
+class NumaAddressReconcileTestCase(ManagerTestCase):
+
+    def test_osds_bind_their_node_address(self):
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        state = self.reconcile(
+            rp.PROFILE_BALANCED, [osd(0, node=0), osd(1, node=1)], epa,
+            networks=per_node_networks())
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(state['warnings'], [])
+        applied = dict((a['osd-id'], a) for _, allocations in self.applied
+                       for a in allocations)
+        self.assertEqual(applied['0']['addresses'],
+                         {'public': '10.0.0.5', 'cluster': '10.0.0.5'})
+        self.assertEqual(applied['1']['addresses'],
+                         {'public': '10.0.1.5', 'cluster': '10.0.1.5'})
+        self.assertEqual(state['osds']['1']['addresses'],
+                         {'public': '10.0.1.5', 'cluster': '10.0.1.5'})
+
+    def test_strict_profile_binds_node_addresses(self):
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        state = self.reconcile(
+            rp.PROFILE_PERFORMANCE, [osd(0, node=1)], epa, nic_nodes=(0,),
+            networks=per_node_networks())
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(state['osds']['0']['addresses'],
+                         {'public': '10.0.1.5', 'cluster': '10.0.1.5'})
+
+    def test_unaligned_allocation_keeps_host_addresses(self):
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        state = self.reconcile(
+            rp.PROFILE_BALANCED, [osd(0, node=None)], epa,
+            networks=per_node_networks())
+        self.assertNotIn('addresses', state['osds']['0'])
+
+    def test_verify_renders_and_checks_addresses(self):
+        addresses = {'public': '10.0.1.5', 'cluster': '10.0.1.5'}
+        self.kv.set(resource_manager.STATE_KEY, {
+            'version': 1, 'profile': rp.PROFILE_BALANCED,
+            'osds': {'0': {'osd-id': '0', 'cores': '20-27',
+                           'mode': rp.MODE_NUMA, 'numa-node': 1,
+                           'numa-policy': 'preferred',
+                           'addresses': addresses}},
+        })
+        epa = FakeEpa(range(0, 32), TWO_NODES,
+                      foreign={'ceph-osd.0': list(range(20, 28))})
+        expected = resource_manager.resource_apply.render_dropin(
+            rp.PROFILE_BALANCED, '20-27', numa_policy='preferred',
+            numa_node=1, addresses=addresses)
+        self.assertIn('CEPH_ARGS=--public-addr 10.0.1.5', expected)
+        with patch.object(resource_manager.resource_apply, 'read_dropin',
+                          return_value=expected):
+            self.assertEqual(
+                resource_manager.verify(client_factory=lambda: epa), [])
+        self.verify_enforcement.assert_called_once_with(
+            '0', '20-27', addresses=addresses)
+
+    def test_status_report_includes_networks_and_addresses(self):
+        host = rp.HostFacts(nodes=TWO_NODES, nic_interface='eth0',
+                            nic_nodes={0}, networks=per_node_networks())
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        with patch.object(resource_manager, 'collect_osd_facts',
+                          return_value=[osd(0, node=1)]), \
+                patch.object(resource_manager, 'collect_host_facts',
+                             return_value=host):
+            report = resource_manager.status_report(
+                dry_run=rp.PROFILE_PERFORMANCE, client_factory=lambda: epa)
+        self.assertEqual(report['networks'][0]['role'], 'public')
+        self.assertTrue(report['networks'][0]['numa-addressing'])
+        self.assertEqual(
+            [c['address'] for c in report['networks'][0]['candidates']],
+            ['10.0.0.5', '10.0.1.5'])
+        self.assertEqual(report['osds'][0]['desired-addresses'],
+                         {'public': '10.0.1.5', 'cluster': '10.0.1.5'})
+        self.assertEqual(report['osds'][0]['applied-addresses'], {})
+        self.assertEqual(report['networks'][0]['source'], 'config')
+
+    def test_dry_run_reports_an_untrusted_binding(self):
+        eth0 = nic('eth0', '10.0.0.5', [0])
+        eth1 = nic('eth1', '10.0.1.5', [1], problems=['routed via eth0'])
+        networks = [rp.NetworkFacts(role, eth0, (eth0, eth1),
+                                    rp.SOURCE_BINDING)
+                    for role in rp.NETWORK_ROLES]
+        host = rp.HostFacts(nodes=TWO_NODES, nic_interface='eth0',
+                            nic_nodes={0}, networks=networks)
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        with patch.object(resource_manager, 'collect_osd_facts',
+                          return_value=[osd(0, node=1)]), \
+                patch.object(resource_manager, 'collect_host_facts',
+                             return_value=host):
+            report = resource_manager.status_report(
+                dry_run=rp.PROFILE_BALANCED, client_factory=lambda: epa)
+        self.assertEqual(len(report['warnings']), 2)
+        self.assertIn('from the Juju public binding', report['warnings'][0])
+        self.assertEqual(report['osds'][0]['desired-addresses'], {})
+        self.assertFalse(report['networks'][0]['numa-addressing'])

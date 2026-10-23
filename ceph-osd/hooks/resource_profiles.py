@@ -21,7 +21,9 @@ applying the plan lives in :mod:`resource_apply`.
 
 Only CPU resources are planned in this iteration.  Memory is handled
 solely as a NUMA *locality* hint (systemd ``NUMAPolicy``); no memory
-sizing, hugepages or Ceph settings are computed here.
+sizing, hugepages or Ceph settings are computed here.  On hosts with a
+Ceph network address per NUMA node, each OSD is also bound to the
+address on its data device's node.
 """
 
 import collections
@@ -68,8 +70,106 @@ OsdFacts = collections.namedtuple(
     ['osd_id', 'data_device', 'aux_devices', 'tier', 'data_node',
      'aux_nodes'])
 
+# ``nic_interface``/``nic_nodes`` describe the host-wide Ceph interface.
+# ``networks`` holds a NetworkFacts per Ceph network role; it is empty when
+# per-NUMA-node addresses were not discovered.
 HostFacts = collections.namedtuple(
-    'HostFacts', ['nodes', 'nic_interface', 'nic_nodes'])
+    'HostFacts', ['nodes', 'nic_interface', 'nic_nodes', 'networks'])
+HostFacts.__new__.__defaults__ = ((),)
+
+ROLE_PUBLIC = 'public'
+ROLE_CLUSTER = 'cluster'
+NETWORK_ROLES = (ROLE_PUBLIC, ROLE_CLUSTER)
+
+# One local address able to carry a Ceph network role.  ``nodes`` are the
+# NUMA nodes of the interface's physical members.  ``problems`` explain why
+# traffic for the address could still cross to another NUMA node's
+# interface (routing or ARP); empty when nothing was found.
+Nic = collections.namedtuple(
+    'Nic', ['interface', 'address', 'nodes', 'problems'])
+
+# Candidate addresses for one Ceph network role.  ``default`` is the
+# host-wide address the charm renders into ceph.conf.  ``source`` says
+# where the role's networks came from: the charm option or the Juju binding.
+NetworkFacts = collections.namedtuple(
+    'NetworkFacts', ['role', 'default', 'candidates', 'source'])
+SOURCE_CONFIG = 'config'
+SOURCE_BINDING = 'binding'
+NetworkFacts.__new__.__defaults__ = (SOURCE_CONFIG,)
+
+
+def nic_to_dict(nic):
+    """Render a Nic as plain data (for state and actions)."""
+    if nic is None:
+        return None
+    return {
+        'interface': nic.interface,
+        'address': nic.address,
+        'numa-nodes': sorted(nic.nodes),
+        'problems': list(nic.problems),
+    }
+
+
+def address_nodes(network):
+    """NUMA nodes served by a candidate address on a single node.
+
+    Interfaces spanning nodes (for example a bond across sockets) and
+    interfaces without NUMA information serve no particular node.
+
+    :rtype: set[int]
+    """
+    return set(
+        next(iter(nic.nodes)) for nic in network.candidates
+        if len(nic.nodes) == 1)
+
+
+def _node_problems(network):
+    """Problems of the candidates that would serve a NUMA node."""
+    return [
+        '{}: {}'.format(nic.address, problem)
+        for nic in network.candidates if len(nic.nodes) == 1
+        for problem in nic.problems]
+
+
+def untrusted_binding(network, host):
+    """Whether per-node addresses from a Juju binding are refused.
+
+    A binding is always present: without an explicit one it is the
+    default space, which can hold every subnet on the machine, such as a
+    management network on one socket and the storage network on the
+    other.  Per-node addresses from a binding are therefore only used
+    when they pass the routing check, which a deliberately built
+    per-node Ceph network does and such an accidental mix does not.
+
+    :rtype: bool
+    """
+    return (network.source == SOURCE_BINDING and
+            len(host.nodes) > 1 and len(address_nodes(network)) > 1 and
+            bool(_node_problems(network)))
+
+
+def numa_addressing(network, host):
+    """Whether OSDs bind a network role to their NUMA node's address.
+
+    This only applies when candidate addresses cover more than one NUMA
+    node.  A single Ceph interface keeps the host-wide address, and so do
+    per-node addresses from a Juju binding that fail the routing check.
+
+    :rtype: bool
+    """
+    return (len(host.nodes) > 1 and len(address_nodes(network)) > 1 and
+            not untrusted_binding(network, host))
+
+
+def network_to_dict(network, host):
+    """Render a NetworkFacts as plain data (for state and actions)."""
+    return {
+        'role': network.role,
+        'source': network.source,
+        'default': nic_to_dict(network.default),
+        'candidates': [nic_to_dict(nic) for nic in network.candidates],
+        'numa-addressing': numa_addressing(network, host),
+    }
 
 
 def is_managed(profile):
@@ -110,7 +210,7 @@ class OsdRequest(object):
     """The desired allocation for a single OSD."""
 
     def __init__(self, osd_id, tier, cores, mode, numa_node=None,
-                 numa_policy=None, deviations=None):
+                 numa_policy=None, deviations=None, addresses=None):
         self.osd_id = str(osd_id)
         self.tier = tier
         self.cores = cores
@@ -118,6 +218,9 @@ class OsdRequest(object):
         self.numa_node = numa_node
         self.numa_policy = numa_policy
         self.deviations = list(deviations or [])
+        # Network role to the address this OSD binds instead of the
+        # host-wide ceph.conf one, for roles with per-node addresses.
+        self.addresses = dict(addresses or {})
 
     def __repr__(self):
         return (
@@ -135,6 +238,7 @@ class OsdRequest(object):
             'mode': self.mode,
             'numa-node': self.numa_node,
             'numa-policy': self.numa_policy,
+            'addresses': dict(self.addresses),
             'deviations': list(self.deviations),
         }
 
@@ -235,22 +339,96 @@ def _target_node(profile, osd, host, deviations, errors):
             errors.append(message)
             return None
         deviations.append(message)
-
-    # NIC alignment is only a strict-profile requirement.
-    if is_strict(profile):
-        if not host.nic_nodes:
-            deviations.append(
-                'NUMA node of Ceph network interface {} is unknown; '
-                'NIC alignment not verified'.format(
-                    host.nic_interface or 'unknown'))
-        elif node not in host.nic_nodes:
-            errors.append(
-                'data device {} is on node {} but Ceph network interface '
-                '{} is on node(s) {}'.format(
-                    osd.data_device, node, host.nic_interface,
-                    ','.join(str(n) for n in sorted(host.nic_nodes))))
-            return None
     return node
+
+
+def _nodes_text(nodes):
+    return ','.join(str(n) for n in sorted(nodes)) or 'none'
+
+
+def _check_interface(osd, node, interface, nodes, label, deviations,
+                     errors):
+    """Strictly check that a host-wide Ceph interface is on ``node``."""
+    if not nodes:
+        deviations.append(
+            'NUMA node of {} {} is unknown; NIC alignment not '
+            'verified'.format(label, interface or 'unknown'))
+        return
+    if node not in nodes:
+        errors.append(
+            'data device {} is on node {} but {} {} is on node(s) '
+            '{}'.format(osd.data_device, node, label, interface,
+                        _nodes_text(nodes)))
+
+
+def _local_nic(network, node):
+    """Pick the candidate address on ``node``: the host-wide one if local."""
+    local = [nic for nic in network.candidates if set(nic.nodes) == {node}]
+    for nic in local:
+        if network.default and nic.address == network.default.address:
+            return nic
+    if not local:
+        return None
+    return sorted(local, key=lambda n: (n.interface or '', n.address))[0]
+
+
+def _select_addresses(profile, osd, node, host, deviations, errors):
+    """Choose the Ceph network addresses an OSD binds on its NUMA node.
+
+    A network role whose candidate addresses cover more than one NUMA
+    node binds each OSD to its node's address.  Otherwise the host-wide
+    address applies, and only the strict profile checks its locality.
+
+    :returns: mapping of network role to address; empty when every role
+        uses the host-wide address
+    :rtype: dict[str, str]
+    """
+    if len(host.nodes) <= 1:
+        return {}
+    strict = is_strict(profile)
+    active = [n for n in host.networks if numa_addressing(n, host)]
+    if not active:
+        if strict:
+            _check_interface(osd, node, host.nic_interface, host.nic_nodes,
+                             'Ceph network interface', deviations, errors)
+        return {}
+
+    addresses = {}
+    for network in host.networks:
+        label = 'Ceph {} network'.format(network.role)
+        if network not in active:
+            if strict:
+                default = network.default
+                _check_interface(
+                    osd, node, default.interface if default else None,
+                    default.nodes if default else (),
+                    '{} interface'.format(label), deviations, errors)
+            continue
+        nic = _local_nic(network, node)
+        if nic is None:
+            message = ('no {} address on NUMA node {} of data device {} '
+                       '(addresses serve node(s) {})'.format(
+                           label, node, osd.data_device,
+                           _nodes_text(address_nodes(network))))
+            if strict:
+                errors.append(message)
+                continue
+            if network.default is None:
+                deviations.append(message)
+                continue
+            deviations.append('{}; using host address {}'.format(
+                message, network.default.address))
+            nic = network.default
+        else:
+            for problem in nic.problems:
+                message = '{} address {} on node {}: {}'.format(
+                    label, nic.address, node, problem)
+                if strict:
+                    errors.append(message)
+                else:
+                    deviations.append(message)
+        addresses[network.role] = nic.address
+    return addresses
 
 
 def build_plan(profile, osds, host):
@@ -269,6 +447,16 @@ def build_plan(profile, osds, host):
 
     plan = Plan(profile)
     policy = PROFILE_NUMA_POLICY[profile]
+    if profile != PROFILE_MINIMAL and osds:
+        for network in host.networks:
+            if untrusted_binding(network, host):
+                plan.warnings.append(
+                    'not binding OSDs to per-node addresses from the Juju {} '
+                    'binding, which fail the routing check ({}); OSDs keep '
+                    'host address {}'.format(
+                        network.role, '; '.join(_node_problems(network)),
+                        network.default.address if network.default
+                        else 'unknown'))
     for osd in sorted(osds, key=lambda o: int(o.osd_id)):
         deviations = []
         errors = []
@@ -279,6 +467,10 @@ def build_plan(profile, osds, host):
             node = None
         else:
             node = _target_node(profile, osd, host, deviations, errors)
+        addresses = {}
+        if node is not None and not errors:
+            addresses = _select_addresses(
+                profile, osd, node, host, deviations, errors)
         if errors:
             plan.errors.extend(
                 'osd.{}: {}'.format(osd.osd_id, error) for error in errors)
@@ -292,6 +484,7 @@ def build_plan(profile, osds, host):
             numa_node=node,
             numa_policy=policy if mode == MODE_NUMA else None,
             deviations=deviations,
+            addresses=addresses,
         ))
     return plan
 
