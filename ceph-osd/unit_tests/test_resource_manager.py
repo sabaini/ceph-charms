@@ -516,8 +516,12 @@ class BalancedReconcileTestCase(ManagerTestCase):
         epa = FakeEpa(range(0, 32), TWO_NODES)
         osds = [osd(0, node=0, aux_nodes={'/dev/nvme9n1': 1})]
         state = self.reconcile(rp.PROFILE_BALANCED, osds, epa)
-        self.assertTrue(any('/dev/nvme9n1' in warning
-                            for warning in state['warnings']))
+        # Reported once, although allocation also records it.
+        self.assertEqual(
+            [w for w in state['warnings'] if '/dev/nvme9n1' in w],
+            ['osd.0: device /dev/nvme9n1 is on node 1 but data device '
+             '/dev/nvme0n1 is on node 0'])
+        self.assertEqual(len(state['osds']['0']['deviations']), 1)
         self.assertEqual(len(epa.claims['ceph-osd.0']), 8)
 
     def test_capacity_shortfall_is_only_a_warning(self):

@@ -634,6 +634,9 @@ def _allocate_flexible(client, plan, previous_osds, state, osds, profile):
             errors.append('osd.{}: {}'.format(osd_id, exc))
             break
         deviations = list(request.deviations)
+        # Planned deviations are already reported from the plan; only
+        # report what allocation adds.
+        planned = len(deviations)
         cores = []
         mode = request.mode
         numa_node = request.numa_node
@@ -680,7 +683,8 @@ def _allocate_flexible(client, plan, previous_osds, state, osds, profile):
             deviations.append(
                 'no CPUs available; leaving this OSD unpinned')
             warnings.extend(
-                'osd.{}: {}'.format(request.osd_id, d) for d in deviations)
+                'osd.{}: {}'.format(request.osd_id, d)
+                for d in deviations[planned:])
             # Drop stale enforcement so that the OSD is not pinned to
             # CPUs the charm no longer owns.
             try:
@@ -704,7 +708,8 @@ def _allocate_flexible(client, plan, previous_osds, state, osds, profile):
                 'allocated {} of {} requested logical CPUs'.format(
                     len(cores), request.cores))
         warnings.extend(
-            'osd.{}: {}'.format(request.osd_id, d) for d in deviations)
+            'osd.{}: {}'.format(request.osd_id, d)
+            for d in deviations[planned:])
         allocation = _allocation(request, cores, mode, numa_node)
         allocation['deviations'] = deviations
         transition = state['pending-transitions'].get(osd_id)
