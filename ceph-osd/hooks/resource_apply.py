@@ -205,6 +205,11 @@ def _unit_active(osd_id):
          'ceph-osd@{}.service'.format(osd_id)]) == 0
 
 
+def osd_unit_active(osd_id):
+    """Report whether an OSD's systemd unit is still active."""
+    return _unit_active(osd_id)
+
+
 def _unit_main_pid(osd_id):
     """Return an active OSD unit's main PID, or None."""
     try:
