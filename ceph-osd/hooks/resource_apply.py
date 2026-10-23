@@ -145,9 +145,13 @@ def render_dropin(profile, cores, numa_policy=None, numa_node=None):
     lines.append(
         'Environment="CEPH_CONF=/var/lib/charm/{}/ceph.conf"\n'.format(
             _application_name()))
+    # systemd merges list assignments across the unit and its drop-ins; an
+    # empty assignment discards any mask set before this drop-in.
+    lines.append('CPUAffinity=\n')
     lines.append('CPUAffinity={}\n'.format(format_cpu_list(cores)))
     if numa_policy and numa_node is not None:
         lines.append('NUMAPolicy={}\n'.format(numa_policy))
+        lines.append('NUMAMask=\n')
         lines.append('NUMAMask={}\n'.format(numa_node))
     return ''.join(lines)
 

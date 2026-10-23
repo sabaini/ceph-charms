@@ -45,6 +45,14 @@ class DropinTestCase(unittest.TestCase):
         self.assertIn('NUMAPolicy=bind\n', content)
         self.assertIn('NUMAMask=1\n', content)
 
+    def test_render_dropin_resets_inherited_masks(self):
+        # systemd merges list settings across drop-ins; an inherited
+        # NUMAMask=0 would otherwise widen memory placement to nodes 0-1.
+        content = resource_apply.render_dropin(
+            'performance', [4, 5, 6, 7], numa_policy='bind', numa_node=1)
+        self.assertIn('CPUAffinity=\nCPUAffinity=4-7\n', content)
+        self.assertIn('NUMAMask=\nNUMAMask=1\n', content)
+
     def test_render_dropin_without_numa_policy(self):
         content = resource_apply.render_dropin('minimal', [2, 9])
         self.assertIn('CPUAffinity=2,9\n', content)
