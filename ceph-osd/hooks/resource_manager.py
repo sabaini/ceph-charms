@@ -269,10 +269,20 @@ def _new_transition_matches(transition, request):
             transition.get('requested') == request.cores)
 
 
-def _needs_transition(previous, request):
-    """Whether changing this request could release CPUs used by an OSD."""
+def _needs_transition(previous, request, transition=None):
+    """Whether changing this request could release CPUs used by an OSD.
+
+    A failed replacement leaves the applied record describing the old
+    allocation while the OSD may already run on, and EPA hold, the pending
+    target. Returning to the recorded shape must still stop and fully
+    release that target: a NUMA claim only replaces CPUs on its own node.
+    """
     if not previous:
         return False
+    if transition and (transition.get('mode') != request.mode or
+                       transition.get('numa-node') != request.numa_node or
+                       transition.get('requested') != request.cores):
+        return True
     count = previous.get('count')
     if count is None:
         count = len(parse_cpu_list(previous.get('cores') or ''))
@@ -326,6 +336,9 @@ def _stop_before_replacing(client, service, previous, request, state):
         'status': 'stopping',
     })
     _save_state(state)
+    # The replacement claim may grant the same CPUs, leaving the drop-in
+    # unchanged; the stopped OSD must still be restarted.
+    resource_apply.mark_restart_pending(request.osd_id)
     resource_apply.stop_osd(request.osd_id)
     transition['status'] = 'stopped'
     _save_state(state)
@@ -455,7 +468,7 @@ def _apply_strict(client, plan, previous_osds, state, osds, profile,
         transition = state.setdefault('pending-transitions', {}).get(osd_id)
         new_claim = False
         try:
-            if _needs_transition(previous, request):
+            if _needs_transition(previous, request, transition):
                 if not _transition_matches(transition, request):
                     _release_for_replacement(
                         client, service, previous, request, state)
@@ -541,7 +554,8 @@ def _apply_strict(client, plan, previous_osds, state, osds, profile,
 
 def _reset_claim(client, service, previous, request, state):
     """Safely reset a flexible claim whose placement shape changed."""
-    if not _needs_transition(previous, request):
+    transition = state.get('pending-transitions', {}).get(str(request.osd_id))
+    if not _needs_transition(previous, request, transition):
         return
     _release_for_replacement(client, service, previous, request, state)
 
