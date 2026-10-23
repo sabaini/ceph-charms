@@ -22,6 +22,7 @@ schedulable CPU IDs the kernel exposes), never physical cores.
 """
 
 import glob
+import ipaddress
 import json
 import os
 import subprocess
@@ -30,6 +31,7 @@ CPU_ROOT = 'sys/devices/system/cpu'
 NODE_ROOT = 'sys/devices/system/node'
 BLOCK_ROOT = 'sys/class/block'
 NET_ROOT = 'sys/class/net'
+ARP_ROOT = 'proc/sys/net/ipv4/conf'
 
 # ceph-volume reports the logical volume type for every device backing an
 # OSD.  Only the 'block' device carries the OSD data.
@@ -219,6 +221,34 @@ def _numa_node_from_sysfs_path(start, root='/'):
     return None
 
 
+def _stacked_numa_node(block, root='/', _seen=None):
+    """Resolve the NUMA node of a block device through its stack.
+
+    Device-mapper devices list their underlying devices in ``slaves/``.
+    With native NVMe multipath the namespace head lives below a virtual
+    ``nvme-subsystem`` device that carries no PCI ancestry; its
+    PCI-attached path devices (``nvmeXcYnZ``) are linked from
+    ``multipath/``.  The first lower device exposing a node wins.
+    """
+    if _seen is None:
+        _seen = set()
+    current = os.path.realpath(block)
+    if current in _seen:
+        return None
+    _seen.add(current)
+    disk = current
+    if os.path.exists(os.path.join(current, 'partition')):
+        # A partition's stack belongs to its parent disk.
+        disk = os.path.dirname(current)
+    lowers = sorted(glob.glob(os.path.join(current, 'slaves', '*')))
+    lowers.extend(sorted(glob.glob(os.path.join(disk, 'multipath', '*'))))
+    for lower in lowers:
+        node = _stacked_numa_node(lower, root=root, _seen=_seen)
+        if node is not None:
+            return node
+    return _numa_node_from_sysfs_path(current, root=root)
+
+
 def device_numa_node(device, root='/'):
     """Return the NUMA node backing a block device.
 
@@ -229,15 +259,7 @@ def device_numa_node(device, root='/'):
     block = _block_dir(device, root=root)
     if block is None:
         return None
-    slaves = sorted(glob.glob(os.path.join(block, 'slaves', '*')))
-    if slaves:
-        # Device-mapper stack: use the first underlying device that
-        # exposes a NUMA node.
-        for slave in slaves:
-            node = _numa_node_from_sysfs_path(slave, root=root)
-            if node is not None:
-                return node
-    return _numa_node_from_sysfs_path(block, root=root)
+    return _stacked_numa_node(block, root=root)
 
 
 def _net_leaf_interfaces(interface, root='/', _seen=None):
@@ -282,6 +304,48 @@ def interface_numa_nodes(interface, root='/'):
     return nodes
 
 
+def parse_ip(value):
+    """Parse an IP address, returning None for anything else.
+
+    :rtype: ipaddress.IPv4Address or ipaddress.IPv6Address or None
+    """
+    try:
+        return ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return None
+
+
+def local_addresses():
+    """List the IP addresses configured on the host's interfaces.
+
+    :returns: dicts with ``interface``, ``address`` and ``prefixlen``
+        keys, and a ``primary`` flag that is False for secondary,
+        temporary or deprecated addresses; in ``ip`` order, empty when
+        addresses cannot be listed.
+    :rtype: list[dict]
+    """
+    try:
+        output = subprocess.check_output(
+            ['ip', '-json', 'addr', 'show'], stderr=subprocess.DEVNULL)
+        links = json.loads(output.decode('UTF-8'))
+    except (subprocess.CalledProcessError, OSError, ValueError):
+        return []
+    addresses = []
+    for link in links:
+        for info in link.get('addr_info', []):
+            if not info.get('local'):
+                continue
+            addresses.append({
+                'interface': link.get('ifname'),
+                'address': info['local'],
+                'prefixlen': info.get('prefixlen'),
+                'primary': not (info.get('secondary') or
+                                info.get('temporary') or
+                                info.get('deprecated')),
+            })
+    return addresses
+
+
 def interface_for_address(address):
     """Return the interface that holds an IP address.
 
@@ -289,19 +353,62 @@ def interface_for_address(address):
     :type address: str
     :rtype: str or None
     """
-    if not address:
+    wanted = parse_ip(address) if address else None
+    if wanted is None:
         return None
+    for entry in local_addresses():
+        if parse_ip(entry['address']) == wanted:
+            return entry['interface']
+    return None
+
+
+def route_interface(destination, source):
+    """Return the interface the kernel routes a source/destination pair to.
+
+    This is a routing table lookup (``ip route get``); no traffic is
+    sent.  Source-based policy routing is taken into account.
+
+    :param destination: destination IP address
+    :type destination: str
+    :param source: local source IP address
+    :type source: str
+    :returns: the egress interface, or None when there is no route
+    :rtype: str or None
+    """
     try:
         output = subprocess.check_output(
-            ['ip', '-json', 'addr', 'show'], stderr=subprocess.DEVNULL)
-        links = json.loads(output.decode('UTF-8'))
+            ['ip', '-json', 'route', 'get', str(destination),
+             'from', str(source)],
+            stderr=subprocess.DEVNULL)
+        routes = json.loads(output.decode('UTF-8'))
     except (subprocess.CalledProcessError, OSError, ValueError):
         return None
-    for link in links:
-        for info in link.get('addr_info', []):
-            if info.get('local') == address:
-                return link.get('ifname')
+    for route in routes:
+        if route.get('dev'):
+            return route['dev']
     return None
+
+
+def arp_settings(interface, root='/'):
+    """Return the effective IPv4 ARP flux settings of an interface.
+
+    The kernel applies the larger of the ``all`` and the per-interface
+    value for both ``arp_ignore`` and ``arp_announce``.
+
+    :returns: tuple of (arp_ignore, arp_announce); an element is None
+        when it cannot be read
+    :rtype: tuple
+    """
+    def effective(name):
+        values = []
+        for scope in ('all', interface):
+            value = _read(os.path.join(root, ARP_ROOT, scope, name))
+            try:
+                values.append(int(value))
+            except (TypeError, ValueError):
+                return None
+        return max(values)
+    return effective('arp_ignore'), effective('arp_announce')
 
 
 def osd_device_map():

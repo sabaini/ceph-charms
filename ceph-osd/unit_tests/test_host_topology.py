@@ -206,6 +206,87 @@ class SysfsTestCase(unittest.TestCase):
         self.assertEqual(
             host_topology.device_numa_node('/dev/dm-0', root=self.root), 1)
 
+    def add_multipath_namespace(self, name='nvme0n1', paths=None):
+        """Add a native NVMe multipath namespace head and its paths.
+
+        :param paths: mapping of path device name to (PCI address, node)
+        """
+        head = self.path('sys/devices/virtual/nvme-subsystem/nvme-subsys0',
+                         name)
+        write(os.path.join(head, 'queue', 'rotational'), '0\n')
+        os.makedirs(os.path.join(head, 'multipath'))
+        for path_name, (pci, node) in sorted((paths or {}).items()):
+            controller = 'nvme{}'.format(path_name[len('nvme'):].split(
+                'c')[1].split('n')[0])
+            device_dir = self.path('sys/devices/pci0000:00', pci)
+            path_dir = os.path.join(device_dir, 'nvme', controller, path_name)
+            write(os.path.join(path_dir, 'queue', 'rotational'), '0\n')
+            if node is not None:
+                write(os.path.join(device_dir, 'numa_node'),
+                      '{}\n'.format(node))
+            os.symlink(path_dir, os.path.join(head, 'multipath', path_name))
+        link = self.path('sys/class/block', name)
+        if not os.path.isdir(os.path.dirname(link)):
+            os.makedirs(os.path.dirname(link))
+        os.symlink(head, link)
+        return head
+
+    def test_device_numa_node_through_nvme_multipath(self):
+        self.add_multipath_namespace(paths={
+            'nvme0c0n1': ('0000:00:1f.4', 1),
+        })
+        self.assertEqual(
+            host_topology.device_numa_node('/dev/nvme0n1', root=self.root), 1)
+        self.assertFalse(
+            host_topology.device_is_rotational('/dev/nvme0n1',
+                                               root=self.root))
+
+    def test_device_numa_node_skips_paths_without_a_node(self):
+        self.add_multipath_namespace(paths={
+            'nvme0c0n1': ('0000:00:1f.4', -1),
+            'nvme0c1n1': ('0000:00:1f.5', 0),
+        })
+        self.assertEqual(
+            host_topology.device_numa_node('/dev/nvme0n1', root=self.root), 0)
+
+    def test_device_numa_node_through_multipath_partition(self):
+        head = self.add_multipath_namespace(paths={
+            'nvme0c0n1': ('0000:00:1f.4', 1),
+        })
+        partition = os.path.join(head, 'nvme0n1p1')
+        write(os.path.join(partition, 'partition'), '1\n')
+        os.symlink(partition, self.path('sys/class/block/nvme0n1p1'))
+        self.assertEqual(
+            host_topology.device_numa_node('/dev/nvme0n1p1', root=self.root),
+            1)
+
+    def test_device_numa_node_dm_over_multipath(self):
+        self.add_multipath_namespace(paths={
+            'nvme0c0n1': ('0000:00:1f.4', 1),
+        })
+        dm_dir = self.path('sys/class/block/dm-0')
+        os.makedirs(os.path.join(dm_dir, 'slaves'))
+        os.symlink(self.path('sys/class/block/nvme0n1'),
+                   os.path.join(dm_dir, 'slaves', 'nvme0n1'))
+        self.assertEqual(
+            host_topology.device_numa_node('/dev/dm-0', root=self.root), 1)
+
+    def test_device_numa_node_multipath_without_paths(self):
+        self.add_multipath_namespace()
+        self.assertIsNone(
+            host_topology.device_numa_node('/dev/nvme0n1', root=self.root))
+
+    def test_arp_settings(self):
+        conf = 'proc/sys/net/ipv4/conf'
+        for scope, ignore, announce in (('all', 0, 2), ('eth1', 1, 0)):
+            write(self.path(conf, scope, 'arp_ignore'), '{}\n'.format(ignore))
+            write(self.path(conf, scope, 'arp_announce'),
+                  '{}\n'.format(announce))
+        self.assertEqual(
+            host_topology.arp_settings('eth1', root=self.root), (1, 2))
+        self.assertEqual(
+            host_topology.arp_settings('eth9', root=self.root), (None, None))
+
     def test_interface_numa_nodes(self):
         self.add_nic('eth0', numa_node=1)
         self.assertEqual(
@@ -251,6 +332,61 @@ class InterfaceLookupTestCase(unittest.TestCase):
     def test_interface_for_address_command_failure(self, check_output):
         check_output.side_effect = OSError('no ip command')
         self.assertIsNone(host_topology.interface_for_address('10.0.0.5'))
+
+    @patch.object(host_topology.subprocess, 'check_output')
+    def test_interface_for_address_compares_addresses(self, check_output):
+        check_output.return_value = json.dumps([
+            {'ifname': 'eth1', 'addr_info': [{'local': '2001:db8::5'}]},
+        ]).encode('UTF-8')
+        self.assertEqual(
+            host_topology.interface_for_address('2001:0db8:0:0::5'), 'eth1')
+        self.assertIsNone(host_topology.interface_for_address('not-an-ip'))
+
+    @patch.object(host_topology.subprocess, 'check_output')
+    def test_local_addresses(self, check_output):
+        check_output.return_value = json.dumps([
+            {'ifname': 'eth0', 'addr_info': [
+                {'family': 'inet', 'local': '10.0.0.5', 'prefixlen': 24},
+                {'family': 'inet', 'local': '10.0.0.9', 'prefixlen': 24,
+                 'secondary': True},
+                {'family': 'inet6', 'local': '2001:db8::99',
+                 'prefixlen': 64, 'temporary': True},
+                {'family': 'inet6', 'local': '2001:db8::5', 'prefixlen': 64,
+                 'deprecated': True},
+                {'family': 'inet6', 'prefixlen': 64},
+            ]},
+        ]).encode('UTF-8')
+        self.assertEqual(host_topology.local_addresses(), [
+            {'interface': 'eth0', 'address': '10.0.0.5', 'prefixlen': 24,
+             'primary': True},
+            {'interface': 'eth0', 'address': '10.0.0.9', 'prefixlen': 24,
+             'primary': False},
+            {'interface': 'eth0', 'address': '2001:db8::99',
+             'prefixlen': 64, 'primary': False},
+            {'interface': 'eth0', 'address': '2001:db8::5', 'prefixlen': 64,
+             'primary': False},
+        ])
+
+    @patch.object(host_topology.subprocess, 'check_output')
+    def test_route_interface(self, check_output):
+        check_output.return_value = json.dumps([
+            {'dst': '10.0.0.1', 'dev': 'eth1', 'prefsrc': '10.0.1.5'},
+        ]).encode('UTF-8')
+        self.assertEqual(
+            host_topology.route_interface('10.0.0.1', '10.0.1.5'), 'eth1')
+        check_output.assert_called_once_with(
+            ['ip', '-json', 'route', 'get', '10.0.0.1', 'from', '10.0.1.5'],
+            stderr=subprocess.DEVNULL)
+
+    @patch.object(host_topology.subprocess, 'check_output')
+    def test_route_interface_without_route(self, check_output):
+        check_output.side_effect = subprocess.CalledProcessError(2, 'ip')
+        self.assertIsNone(
+            host_topology.route_interface('10.0.0.1', '10.0.1.5'))
+        check_output.side_effect = None
+        check_output.return_value = b'[{}]'
+        self.assertIsNone(
+            host_topology.route_interface('10.0.0.1', '10.0.1.5'))
 
 
 class OsdDeviceMapTestCase(unittest.TestCase):
