@@ -199,8 +199,9 @@ cluster-wide mutex or a guarantee that all placement groups are clean.
 
 ## Lifecycle
 
-* `config-changed`, `storage.real` (new OSDs), `upgrade-charm` and
-  `post-series-upgrade` request reconciliation. Peer events advance the
+* `config-changed`, `storage.real` (new OSDs), the `add-disk` action,
+  `upgrade-charm` and `post-series-upgrade` request reconciliation. Peer
+  events advance the
   rolling operation, and `start` can resume an interrupted local turn.
   Recalculation is idempotent: an unchanged plan restarts nothing.
 * `update-status` only **verifies**. Drift between the applied
