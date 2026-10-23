@@ -1088,7 +1088,12 @@ def assess_status():
 @hooks.hook('stop')
 def stop():
     log('Releasing OSD CPU allocations', level=INFO)
-    resource_manager.safe_release_all()
+    if not resource_manager.safe_release_all():
+        # Once the unit is gone nothing would retry the cleanup, leaving
+        # CPU claims reserved on the host. Resolving the unit retries.
+        log('Cannot release OSD CPU allocations; refusing to complete unit '
+            'removal', level=ERROR)
+        sys.exit(1)
 
 
 @hooks.hook('resource-peers-relation-joined',

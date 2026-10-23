@@ -69,6 +69,12 @@ class ResourceHookTestCase(test_utils.CharmTestCase):
         release.assert_called_once_with(
             client_factory=resource_manager.EpaClient)
 
+    def test_stop_fails_when_claims_remain(self):
+        # Unit removal must not orphan CPU claims that only it could retry.
+        self.resource_manager.safe_release_all.return_value = False
+        with self.assertRaises(SystemExit):
+            hooks.stop()
+
     def test_update_status_verifies_without_changing_anything(self):
         hooks.update_status()
         self.resource_manager.safe_verify.assert_called_once_with()
