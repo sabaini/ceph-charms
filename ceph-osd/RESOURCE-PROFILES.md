@@ -50,10 +50,100 @@ information that does not exist.
 The practical consequence on a two-socket host with drives on both
 sockets and a single Ceph NIC is that `performance` can never be
 satisfied for the drives on the far socket. Use `balanced` there, or
-provide a Ceph network interface per socket.
+provide a Ceph network interface per socket (see
+[NUMA-local Ceph networking](#numa-local-ceph-networking)).
 
 The whole host is planned as a unit: if any OSD cannot be satisfied,
 nothing is claimed, no drop-in is written and no OSD is restarted.
+
+## NUMA-local Ceph networking
+
+A host can carry a Ceph address per NUMA node, for example one NIC per
+socket, each with its own IP address. `performance` and `balanced` then
+bind every NUMA-aligned OSD to the address on its **data device's** node,
+so that disk and network DMA stay on one socket.
+
+Candidate addresses are the host's primary global addresses inside a
+Ceph network, of the same address family as the host-wide address. As for
+the host-wide address, the networks come from `ceph-public-network`
+(`ceph-cluster-network`) when set, and otherwise from the subnets of the
+`public` (`cluster`) binding's space on the machine. Without a cluster
+network option, cluster traffic follows the per-node public address
+whenever the host-wide public and cluster addresses are the same.
+Secondary IPv4 addresses (such as VIPs) and temporary or deprecated IPv6
+addresses are ignored. An interface's NUMA node comes from its physical
+members; a bond with members on both sockets serves no particular node.
+
+Per-node addressing applies to a network only when its candidates cover
+more than one NUMA node. With a single Ceph interface nothing changes:
+OSDs use the host-wide address from `ceph.conf`, and only `performance`
+checks that interface's locality, as before.
+
+A binding is always present: an endpoint that is not bound explicitly
+uses the default space, which can hold every subnet on the machine, for
+example a management network on one socket and the storage network on the
+other. Per-node addresses from a binding are therefore only used when every
+candidate serving a NUMA node passes the routing check below. A deliberately
+built per-node Ceph network passes it; such an accidental mix does not, and
+the OSDs keep the host-wide address with a warning (`performance` then
+checks the host-wide interface's locality). Addresses from the charm
+options are an explicit statement and are used regardless; routing problems
+are then deviations or errors as described below. Bind `public` and
+`cluster` to a dedicated space, or set the options, to make the intent
+explicit.
+
+When per-node addressing applies:
+
+* the OSD's systemd drop-in carries the addresses, which take precedence
+  over the host-wide ones in `ceph.conf`, and binds outgoing connections
+  to them too (`ms_bind_before_connect`):
+
+  ```
+  Environment="CEPH_ARGS=--public-addr 10.0.1.11 --cluster-addr 10.0.1.11 --ms-bind-before-connect true"
+  ```
+
+  Address changes therefore restart OSDs through the same rolling operation
+  as CPU changes, and are verified after the restart: the daemon must report
+  the planned `public_addr`/`cluster_addr` and listen on them.
+* `performance` refuses an OSD whose node has no address, and `balanced`
+  falls back to the host-wide address with a deviation. OSDs without a
+  known data device node, and every OSD under `minimal`, keep the host-wide
+  address.
+* when another network still has a single interface, `performance` checks
+  that interface's locality.
+
+### Host networking prerequisites
+
+The charm does not configure host networking; correct routing remains the
+operator's responsibility. As a safety net, each candidate address is
+checked against the kernel routing table (`ip route get <dest> from
+<address>`) for every Ceph network and every candidate's subnet, using one
+non-local address of each network as the destination (either end of a /31
+or /127). This is a heuristic: it does not send traffic, and a more
+specific route to an individual peer is not seen. A route through an
+interface on another NUMA node, a route that cannot be resolved, or a
+candidate without any address to probe is an error for `performance` and a
+deviation for `balanced`; for networks from a Juju binding it disables
+per-node addressing instead (see above). Probing failures are logged as
+warnings. Typical causes and fixes:
+
+* **One subnet per NIC**: without source-based policy routing, traffic from
+  the second NIC's address to the first NIC's subnet leaves through the
+  first NIC. Add a routing table per address, for example with netplan
+  `routing-policy` and `routes` (`table: ...`), so that traffic from an
+  address leaves through its own interface.
+* **Both NICs on one subnet**: in addition to policy routing, IPv4 ARP flux
+  protection is required, otherwise either NIC may answer for the other's
+  address. The charm requires effective `arp_ignore >= 1` and
+  `arp_announce >= 2` on those interfaces. IPv6 neighbour discovery is not
+  checked.
+
+Every Ceph client, monitor and peer OSD must be able to reach every
+per-node address. With one subnet per NIC, the monitors' `public_network`
+(the ceph-mon `ceph-public-network` option) must list every per-node
+subnet as well: Ceph raises `OSD_UNREACHABLE` (`HEALTH_ERR`) for OSDs whose
+public address is outside it. Host network changes do not trigger a hook;
+change the configuration or refresh the charm to reconcile them.
 
 ## Degradation ladder
 
@@ -235,6 +325,10 @@ juju run ceph-osd/0 resource-allocation-status
 juju run ceph-osd/0 resource-allocation-status dry-run=performance
 ```
 
+On multi-NUMA hosts the report lists each Ceph network's candidate
+addresses, their NUMA nodes and any routing problems under `networks`,
+and the desired and applied addresses of every OSD.
+
 The action is read-only. `dry-run` previews another profile using the
 same calculation the charm uses when applying one, without claiming
 CPUs, writing drop-ins, restarting OSDs or changing unit status.
@@ -252,5 +346,8 @@ and EPA snap artifacts; it is not part of the default functional-test gate.
 * Per-setting overrides of profile values.
 * Memory sizing, hugepages, Ceph thread/shard settings, kernel queue
   depth and IRQ placement.
+* Host network configuration (addresses, policy routing, ARP settings) and
+  the choice of the nearest NIC by NUMA distance on hosts with sub-NUMA
+  clustering: addresses are only matched to the exact NUMA node.
 * Coordination with other applications, release upgrades or manual restarts;
   placement-group health admission checks.

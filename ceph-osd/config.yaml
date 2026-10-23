@@ -502,7 +502,10 @@ options:
         NVMe/SSD-backed OSD and 4 per HDD-backed OSD, strictly NUMA aligned
         with the OSD devices, the Ceph network interface and OSD memory. A
         request that cannot be satisfied strictly is refused and the unit is
-        blocked.
+        blocked. Where the Ceph networks (`ceph-public-network`/
+        `ceph-cluster-network`, or else the `public`/`cluster` bindings)
+        provide an address on more than one NUMA node, each OSD binds to its
+        node's address.
       * `balanced`: save on resource usage while still providing reasonable
         performance. 8 logical CPUs are allocated per NVMe/SSD-backed OSD and
         2 per HDD-backed OSD, NUMA aligned with the OSD data device and OSD
