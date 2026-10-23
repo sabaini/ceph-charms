@@ -208,8 +208,9 @@ cluster-wide mutex or a guarantee that all placement groups are clean.
   is allocated or restarted from `update-status`. It also reports stalled
   or failed predecessor handoffs without advancing the rollout.
 * `remove-disk` releases that OSD's claim and removes its drop-in.
-  Claims for OSDs that no longer exist on the host are released on the
-  next recalculation.
+  Claims, drop-ins and records for OSDs that no longer exist on the host
+  are released on the next recalculation, including when no OSD remains;
+  an OSD whose systemd unit is still active keeps its claim.
 * Unit teardown (`stop`) releases every claim this unit owns.
 * Switching to `unmanaged` keeps the current allocation and enforcement
   in place. The status records `requested-profile: unmanaged` separately

@@ -195,6 +195,10 @@ class ManagerTestCase(unittest.TestCase):
         self.mark_restart_pending = patcher.start()
         self.addCleanup(patcher.stop)
         patcher = patch.object(resource_manager.resource_apply,
+                               'osd_unit_active', return_value=False)
+        self.osd_unit_active = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(resource_manager.resource_apply,
                                'pending_restarts', return_value=set())
         self.pending_restarts = patcher.start()
         self.addCleanup(patcher.stop)
@@ -445,6 +449,9 @@ class PerformanceReconcileTestCase(ManagerTestCase):
         self.assertEqual(state['osds'], {})
         self.assertEqual(state['errors'], [])
         self.assertEqual(self.applied, [])
+        # A fresh unit neither installs nor queries the allocator.
+        self.ensure_installed.assert_not_called()
+        self.assertEqual(epa.calls, [])
 
     def test_refusal_preserves_the_last_applied_allocation(self):
         epa = FakeEpa(range(0, 32), TWO_NODES)
@@ -1316,6 +1323,94 @@ class ReplacementRestartTestCase(ManagerTestCase):
 
     def test_flexible_return_after_failed_verification_stops_first(self):
         self._return_after_failed_verification(rp.PROFILE_BALANCED)
+
+
+class StaleAllocationTestCase(ManagerTestCase):
+    """OSDs that disappear outside remove-disk are cleaned up and forgotten."""
+
+    def _applied(self, *osd_ids):
+        records = {}
+        for index, osd_id in enumerate(osd_ids):
+            records[osd_id] = {
+                'osd-id': osd_id, 'mode': rp.MODE_ANY, 'numa-node': None,
+                'requested': 2, 'count': 2,
+                'cores': '{}-{}'.format(2 * index, 2 * index + 1),
+                'profile': rp.PROFILE_MINIMAL,
+                'affinity-protection-version':
+                    resource_manager.AFFINITY_PROTECTION_VERSION,
+            }
+        self.kv.set(resource_manager.STATE_KEY, {
+            'version': 1, 'profile': rp.PROFILE_MINIMAL, 'osds': records,
+            'affinity-protection-version':
+                resource_manager.AFFINITY_PROTECTION_VERSION,
+        })
+
+    def test_removed_osd_is_unpinned_released_and_forgotten(self):
+        self._applied('0', '9')
+        epa = FakeEpa(range(0, 16), TWO_NODES,
+                      foreign={'ceph-osd.0': [0, 1], 'ceph-osd.9': [2, 3]})
+        events = []
+        self.clear_allocation.side_effect = (
+            lambda osd_id, **kwargs: events.append(('clear', osd_id)))
+        release = epa.release
+        epa.release = lambda service: (events.append(('release', service)),
+                                       release(service))
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        # Enforcement is removed before the claim, as in release_osd().
+        self.assertEqual(events, [('clear', '9'), ('release', 'ceph-osd.9')])
+        self.assertNotIn('ceph-osd.9', epa.claims)
+        # Otherwise verify() reports the deliberate removal as drift.
+        self.assertEqual(sorted(state['osds']), ['0'])
+
+    def test_failed_cleanup_keeps_the_record_for_retry(self):
+        self._applied('0', '9')
+        epa = FakeEpa(range(0, 16), TWO_NODES,
+                      foreign={'ceph-osd.0': [0, 1], 'ceph-osd.9': [2, 3]})
+        release = epa.release
+
+        def unavailable(service):
+            raise epa_client.EpaUnavailable('down')
+        epa.release = unavailable
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertIn('9', state['osds'])
+        self.assertTrue(any('removed osd.9' in warning
+                            for warning in state['warnings']))
+
+        epa.release = release
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertNotIn('9', state['osds'])
+        self.assertNotIn('ceph-osd.9', epa.claims)
+
+    def test_running_osd_missing_from_inventory_keeps_its_allocation(self):
+        self._applied('0', '9')
+        self.osd_unit_active.side_effect = lambda osd_id: osd_id == '9'
+        epa = FakeEpa(range(0, 16), TWO_NODES,
+                      foreign={'ceph-osd.0': [0, 1], 'ceph-osd.9': [2, 3]})
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(epa.claims['ceph-osd.9'], [2, 3])
+        self.assertIn('9', state['osds'])
+        self.assertNotIn('9', self.cleared)
+        self.assertTrue(any('still running' in warning
+                            for warning in state['warnings']))
+
+    def test_last_removed_osd_is_cleaned_up_without_installing_epa(self):
+        self._applied('9')
+        epa = FakeEpa(range(0, 16), TWO_NODES,
+                      foreign={'ceph-osd.9': [0, 1], 'nova-compute': [4]})
+        state = self.reconcile(rp.PROFILE_MINIMAL, [], epa)
+        self.assertEqual(state['osds'], {})
+        self.assertEqual(self.cleared, ['9'])
+        self.assertEqual(epa.claims, {'nova-compute': [4]})
+        self.ensure_installed.assert_not_called()
+
+    def test_capacity_check_counts_released_stale_cpus(self):
+        # The stale claim leaves only four CPUs on node 0 until released.
+        epa = FakeEpa(range(0, 16), TWO_NODES,
+                      foreign={'ceph-osd.9': list(range(4, 16))})
+        state = self.reconcile(rp.PROFILE_PERFORMANCE, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(epa.claims, {'ceph-osd.0': list(range(0, 12))})
 
 
 class PoolManagementTestCase(ManagerTestCase):

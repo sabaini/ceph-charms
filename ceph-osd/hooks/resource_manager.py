@@ -228,21 +228,44 @@ def _free_for_service(listing, service):
     return free
 
 
-def _release_stale_claims(client, listing, local_osd_ids):
-    """Release claims for OSDs that no longer exist on this host."""
+def _release_stale_claims(client, listing, local_osd_ids, state):
+    """Release allocations for OSDs that no longer exist on this host.
+
+    A missing inventory entry is not proof that no daemon runs on the claim,
+    so an OSD whose unit is still active keeps it. Enforcement is cleared
+    before the claim is released, and the recorded ownership is forgotten
+    only once both are gone, so the next reconcile retries a failure.
+
+    :returns: the OSD IDs whose EPA claims were released
+    :rtype: list[str]
+    """
+    claims = allocations_by_service(listing)
+    stale = set(state['osds'])
+    stale.update(state['pending-transitions'])
+    stale.update(resource_apply.pending_restarts())
+    stale.update(osd_id_for(service) for service in claims)
+    stale.discard(None)
     released = []
-    for service in sorted(allocations_by_service(listing)):
-        osd_id = osd_id_for(service)
-        if osd_id is None or osd_id in local_osd_ids:
+    for osd_id in sorted(stale - set(local_osd_ids)):
+        service = service_name_for(osd_id)
+        if resource_apply.osd_unit_active(osd_id):
+            state['warnings'].append(
+                'osd.{} is missing from the OSD inventory but still '
+                'running; keeping its CPU allocation'.format(osd_id))
             continue
         try:
-            client.release(service)
-        except EpaError as exc:
-            log('Cannot release stale claim {}: {}'.format(service, exc),
-                level=WARNING)
+            resource_apply.clear_allocation(osd_id)
+            if service in claims:
+                client.release(service)
+                released.append(osd_id)
+        except (EpaError, resource_apply.ApplyError) as exc:
+            state['warnings'].append(
+                'cannot release the CPU allocation of removed osd.{}: '
+                '{}'.format(osd_id, exc))
             continue
-        resource_apply.clear_allocation(osd_id)
-        released.append(service)
+        state['osds'].pop(osd_id, None)
+        state['pending-transitions'].pop(osd_id, None)
+        _save_state(state)
     return released
 
 
@@ -937,6 +960,21 @@ def reconcile(client_factory=EpaClient):
 
     if not osds:
         log('No local OSDs found; nothing to allocate', level=DEBUG)
+        if (state['osds'] or state['pending-transitions'] or
+                resource_apply.pending_restarts()):
+            # The last OSD went away outside remove-disk. Release what this
+            # unit recorded, without installing or resizing EPA for a unit
+            # that has nothing left to allocate.
+            try:
+                client = client_factory()
+                _release_stale_claims(
+                    client, client.list_allocations(), set(), state)
+            except EpaError as exc:
+                state['warnings'].append(
+                    'cannot release the CPU allocations of removed OSDs: '
+                    '{}'.format(exc))
+            for warning in state['warnings']:
+                log(warning, level=WARNING)
         _save_state(state)
         return state
 
@@ -961,7 +999,14 @@ def reconcile(client_factory=EpaClient):
         return state
     state['epa'] = epa_state
 
-    _release_stale_claims(client, listing, local_ids)
+    if _release_stale_claims(client, listing, local_ids, state):
+        # The released CPUs are free again; do not refuse a plan over them.
+        try:
+            listing = client.list_allocations()
+        except EpaError as exc:
+            state['errors'] = [str(exc)]
+            _save_state(state)
+            return state
 
     free = set(eligible_cpus(listing))
     free.difference_update(claimed_by_others(listing, own_services))
