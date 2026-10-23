@@ -25,6 +25,12 @@ import resource_profiles as rp
 
 from host_topology import format_cpu_list, parse_cpu_list
 
+# Captured before the fixtures patch them, for tests of real enforcement.
+REAL_APPLY_ALLOCATIONS = resource_manager.resource_apply.apply_allocations
+REAL_PENDING_RESTARTS = resource_manager.resource_apply.pending_restarts
+REAL_MARK_RESTART_PENDING = (
+    resource_manager.resource_apply.mark_restart_pending)
+
 
 class FakeKV(object):
     """In-memory stand-in for the charm's unit database."""
@@ -183,6 +189,10 @@ class ManagerTestCase(unittest.TestCase):
         self.addCleanup(patcher.stop)
         patcher = patch.object(resource_manager.resource_apply, 'stop_osd')
         self.stop_osd = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(resource_manager.resource_apply,
+                               'mark_restart_pending')
+        self.mark_restart_pending = patcher.start()
         self.addCleanup(patcher.stop)
         patcher = patch.object(resource_manager.resource_apply,
                                'pending_restarts', return_value=set())
@@ -1203,6 +1213,109 @@ class ClaimLifecycleTestCase(ManagerTestCase):
             resource_manager.release_osd('3', client_factory=Broken))
         self.stop_osd.assert_not_called()
         self.assertEqual(self.cleared, [])
+
+
+class ReplacementRestartTestCase(ManagerTestCase):
+    """A stopped replacement is always restarted and fully released."""
+
+    def _enforce_with_dropins(self):
+        """Run real enforcement against temporary drop-ins and unit data."""
+        apply = resource_manager.resource_apply
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for name, value in (
+                ('DROPIN_DIR',
+                 directory.name + '/ceph-osd@{osd_id}.service.d'),
+                ('kv', lambda: self.kv),
+                ('daemon_reload', lambda: None)):
+            patcher = patch.object(apply, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(apply, 'restart_osd')
+        restart_osd = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.pending_restarts.side_effect = REAL_PENDING_RESTARTS
+        self.mark_restart_pending.side_effect = REAL_MARK_RESTART_PENDING
+        self.apply_allocations.side_effect = REAL_APPLY_ALLOCATIONS
+        return restart_osd
+
+    def test_restart_obligation_is_recorded_before_stopping(self):
+        events = []
+        self.mark_restart_pending.side_effect = (
+            lambda osd_id: events.append(('mark', osd_id)))
+        self.stop_osd.side_effect = (
+            lambda osd_id: events.append(('stop', osd_id)))
+        self.kv.set(resource_manager.STATE_KEY, {
+            'version': 1, 'profile': rp.PROFILE_PERFORMANCE,
+            'osds': {'0': {'osd-id': '0', 'mode': rp.MODE_NUMA,
+                           'numa-node': 0, 'cores': '0-11'}},
+        })
+        epa = FakeEpa(range(0, 32), TWO_NODES,
+                      foreign={'ceph-osd.0': list(range(0, 12))})
+        self.reconcile(rp.PROFILE_PERFORMANCE, [osd(0, node=1)], epa,
+                       nic_nodes=(1,))
+        self.assertEqual(events, [('mark', '0'), ('stop', '0')])
+
+    def test_degraded_retry_restarts_an_osd_granted_the_same_cpus(self):
+        restart_osd = self._enforce_with_dropins()
+        # minimal requests two CPUs, but only one is eligible.
+        epa = FakeEpa([5], {0: [5], 1: []})
+        nodes = {0: [5], 1: []}
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa,
+                               nodes=nodes)
+        self.assertEqual(state['osds']['0']['count'], 1)
+        restart_osd.reset_mock()
+
+        # A later reconciliation stops the OSD to retry the full request and
+        # is granted the same CPU, so the drop-in bytes do not change.
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa,
+                               nodes=nodes)
+        self.assertEqual(state['errors'], [])
+        self.stop_osd.assert_called_once_with('0')
+        restart_osd.assert_called_once_with(
+            '0', timeout=resource_manager.resource_apply.RESTART_TIMEOUT)
+        self.assertEqual(REAL_PENDING_RESTARTS(), set())
+
+    def _return_after_failed_verification(self, profile):
+        events = []
+        self.stop_osd.side_effect = lambda osd_id: events.append('stop')
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        release, numa = epa.release, epa.allocate_numa_cores
+        epa.release = lambda service: (events.append('release'),
+                                       release(service))
+        epa.allocate_numa_cores = lambda service, node, count: (
+            events.append('claim') or numa(service, node, count))
+        osds = [osd(0, node=1)]
+        self.reconcile(profile, osds, epa, nic_nodes=(1,))
+        applied = list(epa.claims['ceph-osd.0'])
+
+        # minimal restarts the OSD on CPUs from node 0, then verification
+        # fails: the record still describes the first profile.
+        self.apply_allocations.side_effect = (
+            resource_manager.resource_apply.ApplyError('escaped'))
+        state = self.reconcile(rp.PROFILE_MINIMAL, osds, epa, nic_nodes=(1,))
+        self.assertTrue(state['errors'])
+        self.assertEqual(state['osds']['0']['cores'],
+                         format_cpu_list(applied))
+        self.assertTrue(set(epa.claims['ceph-osd.0']).isdisjoint(applied))
+
+        # Returning to the recorded shape must stop the OSD running on the
+        # pending target and fully release it before claiming again.
+        self.apply_allocations.side_effect = self._apply
+        del events[:]
+        state = self.reconcile(profile, osds, epa, nic_nodes=(1,))
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(events[:3], ['stop', 'release', 'claim'])
+        # A NUMA claim only replaces CPUs on its own node; nothing from the
+        # pending target may stay reserved.
+        self.assertEqual(epa.claims['ceph-osd.0'], applied)
+        self.assertNotIn('pending-transitions', state)
+
+    def test_strict_return_after_failed_verification_stops_first(self):
+        self._return_after_failed_verification(rp.PROFILE_PERFORMANCE)
+
+    def test_flexible_return_after_failed_verification_stops_first(self):
+        self._return_after_failed_verification(rp.PROFILE_BALANCED)
 
 
 class PoolManagementTestCase(ManagerTestCase):

@@ -55,6 +55,15 @@ def pending_restarts():
     return set(kv().get(PENDING_KEY) or [])
 
 
+def mark_restart_pending(osd_id):
+    """Record that an OSD must be restarted even if its drop-in is unchanged.
+
+    Stopping an OSD to replace its claim can yield the same CPUs again; the
+    unchanged drop-in must not then be mistaken for a running daemon.
+    """
+    _pending(osd_id, True)
+
+
 def _pending(osd_id, value):
     pending = pending_restarts()
     if value:
