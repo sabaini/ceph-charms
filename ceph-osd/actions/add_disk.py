@@ -34,6 +34,7 @@ from utils import (PartitionIter, device_size, DeviceError)
 
 import ceph_hooks
 import charms_ceph.utils
+import resource_manager
 
 
 CRIMSON_PACKAGES = ['crimson-osd', 'libc-ares2', 'libcrypto++-dev',
@@ -257,6 +258,10 @@ if __name__ == "__main__":
             errors.append(dev)
 
     ch_ceph.send_request_if_needed(request, relation='mon')
+    # The action provisions OSDs outside the hooks, and an unchanged broker
+    # request triggers no mon response. Request the resource rollout for
+    # any OSD that was added, including after a partial failure.
+    resource_manager.safe_reconcile()
     if errors:
         if part_iter is not None:
             for error in errors:
