@@ -1324,6 +1324,87 @@ class ReplacementRestartTestCase(ManagerTestCase):
     def test_flexible_return_after_failed_verification_stops_first(self):
         self._return_after_failed_verification(rp.PROFILE_BALANCED)
 
+    def _return_with_failed_stop(self, profile):
+        events = []
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        release, numa = epa.release, epa.allocate_numa_cores
+        epa.release = lambda service: (events.append('release'),
+                                       release(service))
+        epa.allocate_numa_cores = lambda service, node, count: (
+            events.append('claim') or numa(service, node, count))
+        osds = [osd(0, node=1)]
+        self.reconcile(profile, osds, epa, nic_nodes=(1,))
+        applied = list(epa.claims['ceph-osd.0'])
+        self.apply_allocations.side_effect = (
+            resource_manager.resource_apply.ApplyError('escaped'))
+        self.reconcile(rp.PROFILE_MINIMAL, osds, epa, nic_nodes=(1,))
+        pending = list(epa.claims['ceph-osd.0'])
+        self.apply_allocations.side_effect = self._apply
+
+        def refuse(osd_id):
+            events.append('stop')
+            raise resource_manager.resource_apply.ApplyError('still running')
+        self.stop_osd.side_effect = refuse
+        # Returning to the recorded shape cannot stop the OSD. The claim it
+        # may still run on is kept, and a retry must not skip the stop.
+        for attempt in range(2):
+            del events[:]
+            state = self.reconcile(profile, osds, epa, nic_nodes=(1,))
+            self.assertTrue(state['errors'], attempt)
+            self.assertEqual(events, ['stop'], attempt)
+            self.assertEqual(epa.claims['ceph-osd.0'], pending, attempt)
+
+        self.stop_osd.side_effect = lambda osd_id: events.append('stop')
+        del events[:]
+        state = self.reconcile(profile, osds, epa, nic_nodes=(1,))
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(events[:3], ['stop', 'release', 'claim'])
+        self.assertEqual(epa.claims['ceph-osd.0'], applied)
+
+    def test_strict_retry_after_failed_stop_stops_first(self):
+        self._return_with_failed_stop(rp.PROFILE_PERFORMANCE)
+
+    def test_flexible_retry_after_failed_stop_stops_first(self):
+        self._return_with_failed_stop(rp.PROFILE_BALANCED)
+
+    def test_first_claim_retry_after_failed_stop_stops_first(self):
+        self._enforce_with_dropins()
+        events = []
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        release, any_node = epa.release, epa.allocate_cores
+        epa.release = lambda service: (events.append('release'),
+                                       release(service))
+        epa.allocate_cores = lambda service, count: (
+            events.append('claim') or any_node(service, count))
+        osds = [osd(0, node=1)]
+        # The first allocation is enforced but fails verification, so only
+        # the journal and the drop-in record it.
+        self.verify_enforcement.side_effect = (
+            resource_manager.resource_apply.ApplyError('escaped'))
+        state = self.reconcile(rp.PROFILE_BALANCED, osds, epa, nic_nodes=(1,))
+        self.assertNotIn('0', state['osds'])
+        first = list(epa.claims['ceph-osd.0'])
+        self.verify_enforcement.side_effect = None
+
+        def refuse(osd_id):
+            events.append('stop')
+            raise resource_manager.resource_apply.ApplyError('still running')
+        self.stop_osd.side_effect = refuse
+        for attempt in range(2):
+            del events[:]
+            state = self.reconcile(rp.PROFILE_MINIMAL, osds, epa,
+                                   nic_nodes=(1,))
+            self.assertTrue(state['errors'], attempt)
+            self.assertEqual(events, ['stop'], attempt)
+            self.assertEqual(epa.claims['ceph-osd.0'], first, attempt)
+
+        self.stop_osd.side_effect = lambda osd_id: events.append('stop')
+        del events[:]
+        state = self.reconcile(rp.PROFILE_MINIMAL, osds, epa, nic_nodes=(1,))
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(events[:3], ['stop', 'release', 'claim'])
+        self.assertEqual(sorted(state['osds']), ['0'])
+
 
 class StaleAllocationTestCase(ManagerTestCase):
     """OSDs that disappear outside remove-disk are cleaned up and forgotten."""
