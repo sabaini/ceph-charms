@@ -180,7 +180,9 @@ a recoverable pending transition; previously migrated OSDs remain running and
 are recorded on their new allocations. First allocations are journaled before
 EPA mutation, so an incomplete un-enforced claim is cleaned up or left as an
 explicit blocked cleanup transition. Retrying the rollout resumes the recorded
-transition. Unchanged allocations do not restart OSDs, but the local OSDs must
+transition. If an OSD cannot be confirmed stopped, its claim is kept and the
+unit stays blocked; every retry must stop it again before the allocation
+changes. Unchanged allocations do not restart OSDs, but the local OSDs must
 be active before the host acknowledges completion. Incomplete restarts are
 recorded durably and retried even if the drop-in already contains the desired
 bytes. This remains automatic, unlike the original CE148 proposal's

@@ -299,10 +299,13 @@ def _needs_transition(previous, request, transition=None):
     allocation while the OSD may already run on, and EPA hold, the pending
     target. Returning to the recorded shape must still stop and fully
     release that target: a NUMA claim only replaces CPUs on its own node.
+    A transition records its target before stopping, so a stop that was
+    never confirmed must be repeated even when that target matches.
     """
     if not previous:
         return False
-    if transition and (transition.get('mode') != request.mode or
+    if transition and (transition.get('status') == 'stopping' or
+                       transition.get('mode') != request.mode or
                        transition.get('numa-node') != request.numa_node or
                        transition.get('requested') != request.cores):
         return True
@@ -605,7 +608,8 @@ def _allocate_flexible(client, plan, previous_osds, state, osds, profile):
             # interrupted replacement. Its source fields are retained until
             # a later allocation is enforced and recorded.
             if transition and transition.get('status') in (
-                    'stopped', 'replacing', 'cleanup', 'unallocated'):
+                    'stopping', 'stopped', 'replacing', 'cleanup',
+                    'unallocated'):
                 _release_for_replacement(
                     client, service, previous, request, state)
                 transition = state['pending-transitions'][osd_id]
