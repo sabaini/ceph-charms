@@ -40,7 +40,7 @@ scenarios rather than implicit claims of this test.
 
 ## Build and deploy locally
 
-The bundle uses `ch:ceph-mon` from `tentacle/edge`. Build the current ceph-osd
+The bundle uses `ch:ceph-mon` from `squid/edge`. Build the current ceph-osd
 charm for Ubuntu 24.04 and the EPA snap from its local source tree using
 Charmcraft/Snapcraft. For example:
 

@@ -151,7 +151,7 @@ class BundleTemplateTest(unittest.TestCase):
         mon = bundle['applications']['ceph-mon']
         osd = bundle['applications']['ceph-osd']
         self.assertEqual(mon['charm'], 'ch:ceph-mon')
-        self.assertEqual(mon['channel'], 'tentacle/edge')
+        self.assertEqual(mon['channel'], 'squid/edge')
         self.assertEqual(osd['charm'], '/tmp/ceph-osd.charm')
         self.assertEqual(osd['resources'],
                          {'epa-orchestrator': '/tmp/epa.snap'})
