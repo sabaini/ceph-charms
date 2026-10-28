@@ -23,17 +23,22 @@ profile planner and enforcement:
 4. claim the CPUs, and
 5. enforce them, restarting only the OSDs whose allocation changed.
 
+Enforcement also binds an OSD to a public or cluster network address on
+the NUMA node it is pinned to, when the host has one there.
+
 Allocations are applied automatically, without an operator-initiated restart.
 The hook-facing entry point admits one host at a time through the shared Ceph
 rolling-operation protocol before calculating, claiming or enforcing resources.
 """
 
 import collections
+import ipaddress
 import traceback
 
 from charmhelpers.core.hookenv import (
     config,
     log,
+    network_get,
     resource_get,
     DEBUG,
     ERROR,
@@ -63,20 +68,28 @@ from host_topology import (
     device_numa_node,
     format_cpu_list,
     parse_cpu_list,
-    interface_for_address,
     interface_numa_nodes,
+    local_addresses,
     numa_nodes,
     osd_device_map,
+    spanning_bonds,
 )
 from resource_profiles import (
+    BIND_FALLBACKS,
     HostFacts,
     MODE_ANY,
     MODE_NUMA,
+    NETWORK_CLUSTER,
+    NETWORK_PUBLIC,
+    NETWORK_ROLES,
+    NetworkCandidate,
+    NetworkFacts,
     OsdFacts,
     PROFILE_UNMANAGED,
     PROFILES,
     build_plan,
     check_capacity,
+    choose_addresses,
     is_managed,
     is_strict,
     tier_for_rotational,
@@ -155,17 +168,176 @@ def _epa_charm_managed(value=None):
     return bool(database.get(MANAGED_KEY))
 
 
-def ceph_network_address():
-    """Return the address of the Ceph network used by the OSDs.
+def _host_address(role):
+    """Return the address ceph.conf gives every OSD on one Ceph network.
 
-    The cluster network carries OSD replication traffic and is therefore
-    preferred; the public network is used when no cluster network is
-    configured.
+    This mirrors the ceph.conf rendering: with ``prefer-ipv6`` and a
+    configured network, ceph.conf names no address and Ceph selects one.
 
+    :param role: ``public`` or ``cluster``
+    :type role: str
     :rtype: str or None
     """
     import utils
-    return utils.get_cluster_addr() or utils.get_public_addr()
+    if _config('prefer-ipv6', False):
+        if utils.get_networks('ceph-{}-network'.format(role)):
+            return None
+        return utils.get_ipv6_addr()[0]
+    if role == NETWORK_PUBLIC:
+        return utils.get_public_addr()
+    return utils.get_cluster_addr()
+
+
+def _binding_addresses(role):
+    """Return this unit's addresses on a Juju binding, None when unknown.
+
+    :rtype: set[str] or None
+    """
+    try:
+        info = network_get(role)
+    except Exception as exc:
+        log('Cannot read the {} binding: {}'.format(role, exc), level=DEBUG)
+        return None
+    addresses = set()
+    for binding in (info or {}).get('bind-addresses') or []:
+        for entry in binding.get('addresses') or []:
+            address = entry.get('value') or entry.get('address')
+            if address:
+                addresses.add(address)
+    return addresses
+
+
+def _in_networks(address, networks):
+    """Whether an address lies inside any of the given networks."""
+    parsed = ipaddress.ip_address(address)
+    return any(parsed in network for network in networks)
+
+
+def _network_members(role, addresses):
+    """Select the local addresses belonging to one Ceph network.
+
+    The ``ceph-<role>-network`` option is the filter when set; otherwise
+    the addresses Juju reports for the ``<role>`` binding.
+
+    :param addresses: local ``(interface, address)`` tuples
+    :type addresses: list[tuple[str, str]]
+    :returns: tuple of (source description, selected addresses)
+    :rtype: tuple[str, list[tuple[str, str]]]
+    """
+    option = 'ceph-{}-network'.format(role)
+    configured = _config(option)
+    if configured:
+        networks = []
+        for cidr in configured.split():
+            try:
+                networks.append(ipaddress.ip_network(cidr, strict=False))
+            except ValueError:
+                log('Ignoring invalid {} entry {!r}'.format(option, cidr),
+                    level=WARNING)
+        return option, [(interface, address)
+                        for interface, address in addresses
+                        if _in_networks(address, networks)]
+    bound = _binding_addresses(role)
+    if bound is None:
+        return 'the host address', []
+    return "the '{}' binding".format(role), [
+        (interface, address) for interface, address in addresses
+        if address in bound]
+
+
+def _address_version(address):
+    """Return the IP version of an address, or None when not an IP."""
+    try:
+        return ipaddress.ip_address(address).version
+    except ValueError:
+        return None
+
+
+def _spread_note(bonds):
+    """Explain how bonds spread an interface's traffic over NUMA nodes.
+
+    :param bonds: ``(bond, mode)`` tuples from ``spanning_bonds``
+    :rtype: str or None
+    """
+    notes = []
+    for bond, mode in bonds:
+        if mode == 'active-backup':
+            notes.append(
+                '{} is an active-backup bond without a primary leg, so its '
+                'traffic uses whichever leg is active; set a primary leg to '
+                "make it local to that leg's node".format(bond))
+        else:
+            notes.append('{} is a bond in {} mode, which uses all its '
+                         'legs'.format(bond, mode))
+    return '; '.join(notes) or None
+
+
+def collect_network_facts(root='/'):
+    """Discover the local addresses OSDs could bind on each Ceph network.
+
+    Candidates share the address family of the host-wide address, and the
+    host-wide address is always a candidate when it is local. Addresses on
+    interfaces that are administratively down are never candidates.
+
+    :rtype: dict[str, resource_profiles.NetworkFacts]
+    """
+    addresses = local_addresses()
+    down = local_addresses(up=False)
+    localities = {}
+
+    def locality(interface):
+        """Return an interface's NUMA nodes and why it spans several."""
+        if interface not in localities:
+            nodes = tuple(sorted(interface_numa_nodes(interface, root=root)))
+            note = None
+            if len(nodes) > 1:
+                note = _spread_note(spanning_bonds(interface, root=root))
+            localities[interface] = (nodes, note)
+        return localities[interface]
+
+    facts = {}
+    for role in NETWORK_ROLES:
+        try:
+            host_address = _host_address(role)
+        except Exception as exc:
+            host_address = None
+            log('Cannot determine the Ceph {} address: {}'.format(role, exc),
+                level=WARNING)
+        version = _address_version(host_address) if host_address else None
+        if version is None:
+            version = 6 if _config('prefer-ipv6', False) else 4
+        source, members = _network_members(role, addresses + down)
+        members.extend(
+            (interface, address) for interface, address in addresses + down
+            if address == host_address)
+        candidates = {}
+        ignored = {}
+        for interface, address in members:
+            if _address_version(address) != version:
+                continue
+            if (interface, address) in down:
+                ignored.setdefault(address, interface)
+            elif address not in candidates:
+                nodes, note = locality(interface)
+                candidates[address] = NetworkCandidate(
+                    address=address, interface=interface, nodes=nodes,
+                    note=note)
+        for address, interface in sorted(ignored.items()):
+            if address not in candidates:
+                log('Ignoring Ceph {} network address {} on {}: the '
+                    'interface is administratively down'.format(
+                        role, address, interface), level=INFO)
+        facts[role] = NetworkFacts(
+            role=role, source=source, host_address=host_address,
+            candidates=tuple(sorted(
+                candidates.values(),
+                key=lambda c: ipaddress.ip_address(c.address))))
+        log('Ceph {} network candidates from {}: {}; host address {}'.format(
+            role, source,
+            ', '.join('{} on {}'.format(c.address, c.interface)
+                      for c in facts[role].candidates) or 'none',
+            host_address), level=DEBUG)
+    return facts
 
 
 def collect_host_facts(root='/'):
@@ -174,20 +346,34 @@ def collect_host_facts(root='/'):
     :rtype: resource_profiles.HostFacts
     """
     nodes = numa_nodes(root=root)
-    interface = None
-    nic_nodes = set()
-    try:
-        address = ceph_network_address()
-    except Exception as exc:
-        address = None
-        log('Cannot determine the Ceph network address: {}'.format(exc),
-            level=WARNING)
-    if address:
-        interface = interface_for_address(address)
-    if interface:
-        nic_nodes = interface_numa_nodes(interface, root=root)
-    return HostFacts(nodes=nodes, nic_interface=interface,
-                     nic_nodes=nic_nodes)
+    networks = collect_network_facts(root=root)
+    cluster = networks[NETWORK_CLUSTER].candidates
+    interfaces = sorted(set(c.interface for c in cluster))
+    return HostFacts(nodes=nodes,
+                     nic_interface=','.join(interfaces) or None,
+                     nic_nodes=set(n for c in cluster for n in c.nodes),
+                     networks=networks)
+
+
+def _bind_addresses(osd_id, host, numa_node):
+    """Choose and log the addresses an OSD binds instead of ceph.conf's.
+
+    :returns: allocation keys (``public-addr``, ``cluster-addr``) mapped to
+        an address override, or None to keep the host address, and
+        ``address-binding`` to the decisions
+    :rtype: dict
+    """
+    addresses = dict(('{}-addr'.format(role), None) for role in NETWORK_ROLES)
+    addresses['address-binding'] = []
+    if host is None:
+        return addresses
+    for choice in choose_addresses(host, numa_node):
+        level = (WARNING if choice.outcome in BIND_FALLBACKS or
+                 choice.spanning else INFO)
+        log('osd.{}: {}'.format(osd_id, choice.message), level=level)
+        addresses['{}-addr'.format(choice.role)] = choice.address
+        addresses['address-binding'].append(choice.message)
+    return addresses
 
 
 def collect_osd_facts(root='/'):
@@ -475,7 +661,7 @@ def _cleanup_new_claim(client, service, osd_id, state):
 
 
 def _apply_strict(client, plan, previous_osds, state, osds, profile,
-                  existing_claims):
+                  existing_claims, host=None):
     """Claim and enforce strict allocations one OSD at a time.
 
     A replacement is stopped, released, claimed and restarted before the next
@@ -551,8 +737,9 @@ def _apply_strict(client, plan, previous_osds, state, osds, profile,
                         cleanup_error)
             errors.append(message)
             break
-        allocation = _allocation(request, cores, request.mode,
-                                 request.numa_node)
+        allocation = _allocation(
+            request, cores, request.mode, request.numa_node,
+            _bind_addresses(osd_id, host, request.numa_node))
         transition = state['pending-transitions'].get(osd_id)
         if transition:
             transition.update({
@@ -586,7 +773,8 @@ def _reset_claim(client, service, previous, request, state):
     _release_for_replacement(client, service, previous, request, state)
 
 
-def _allocate_flexible(client, plan, previous_osds, state, osds, profile):
+def _allocate_flexible(client, plan, previous_osds, state, osds, profile,
+                       host=None):
     """Claim CPUs for a non-strict profile, degrading as needed.
 
     The ladder is: the planned NUMA node, then any node, then whatever
@@ -705,7 +893,9 @@ def _allocate_flexible(client, plan, previous_osds, state, osds, profile):
                     len(cores), request.cores))
         warnings.extend(
             'osd.{}: {}'.format(request.osd_id, d) for d in deviations)
-        allocation = _allocation(request, cores, mode, numa_node)
+        allocation = _allocation(
+            request, cores, mode, numa_node,
+            _bind_addresses(osd_id, host, numa_node))
         allocation['deviations'] = deviations
         transition = state['pending-transitions'].get(osd_id)
         if transition:
@@ -732,15 +922,19 @@ def _allocate_flexible(client, plan, previous_osds, state, osds, profile):
     return warnings, errors
 
 
-def _allocation(request, cores, mode, numa_node):
+def _allocation(request, cores, mode, numa_node, addresses=None):
     """Build the record describing one OSD's granted allocation."""
     policy = request.numa_policy if mode == MODE_NUMA else None
+    addresses = addresses or {}
     return {
         'osd-id': request.osd_id,
         'tier': request.tier,
         'mode': mode,
         'numa-node': numa_node,
         'numa-policy': policy,
+        'public-addr': addresses.get('public-addr'),
+        'cluster-addr': addresses.get('cluster-addr'),
+        'address-binding': list(addresses.get('address-binding') or []),
         'requested': request.cores,
         'cores': list(cores),
         'count': len(cores),
@@ -1029,7 +1223,7 @@ def reconcile(client_factory=EpaClient):
     if is_strict(profile):
         errors = _apply_strict(
             client, plan, previous_osds, state, osds, profile,
-            allocations_by_service(listing))
+            allocations_by_service(listing), host=host)
         state['errors'].extend(errors)
         if state['errors']:
             log('Not enforcing allocations for profile {}: {}'.format(
@@ -1040,7 +1234,7 @@ def reconcile(client_factory=EpaClient):
         state['affinity-protection-version'] = AFFINITY_PROTECTION_VERSION
     else:
         warnings, errors = _allocate_flexible(
-            client, plan, previous_osds, state, osds, profile)
+            client, plan, previous_osds, state, osds, profile, host=host)
         state['warnings'].extend(warnings)
         state['errors'].extend(errors)
         if state['errors']:
@@ -1104,17 +1298,20 @@ def verify(client_factory=EpaClient):
 
     claims = allocations_by_service(listing or {})
     for osd_id, record in sorted(osds.items()):
+        addresses = resource_apply.allocation_addresses(record)
         expected = resource_apply.render_dropin(
             record.get('profile', profile), record.get('cores'),
             numa_policy=record.get('numa-policy'),
-            numa_node=record.get('numa-node'))
+            numa_node=record.get('numa-node'),
+            addresses=addresses)
         if resource_apply.read_dropin(osd_id) != expected:
             drift.append(
                 'osd.{}: CPU affinity drop-in differs from the applied '
                 'allocation'.format(osd_id))
         else:
             try:
-                resource_apply.verify_enforcement(osd_id, record.get('cores'))
+                resource_apply.verify_running(
+                    osd_id, record.get('cores'), addresses=addresses)
             except resource_apply.ApplyError as exc:
                 drift.append(str(exc))
         if listing is None:
@@ -1348,6 +1545,7 @@ def status_report(dry_run=None, client_factory=EpaClient):
         'interface': host.nic_interface,
         'numa-nodes': sorted(host.nic_nodes),
     }
+    report['networks'] = _network_report(host)
 
     profile = dry_run or report['requested-profile']
     plan = None
@@ -1369,6 +1567,8 @@ def status_report(dry_run=None, client_factory=EpaClient):
         request = planned.get(osd.osd_id)
         record = applied.get(osd.osd_id) or {}
         claim = claims.get(service_name_for(osd.osd_id)) or {}
+        choices = choose_addresses(host, request.numa_node) if request else []
+        desired = dict((c.role, c.address) for c in choices)
         report['osds'].append({
             'osd-id': osd.osd_id,
             'data-device': osd.data_device,
@@ -1379,12 +1579,37 @@ def status_report(dry_run=None, client_factory=EpaClient):
             'desired-mode': request.mode if request else None,
             'desired-numa-node': request.numa_node if request else None,
             'applied-cores': record.get('cores'),
+            'applied-mode': record.get('mode'),
+            'applied-numa-node': record.get('numa-node'),
             'applied-numa-policy': record.get('numa-policy'),
+            'desired-public-addr': desired.get(NETWORK_PUBLIC),
+            'desired-cluster-addr': desired.get(NETWORK_CLUSTER),
+            'applied-public-addr': record.get('public-addr'),
+            'applied-cluster-addr': record.get('cluster-addr'),
+            # Decisions for the planned node, and those made when the
+            # allocation was applied, which differ after a fallback.
+            'desired-address-binding': [c.message for c in choices],
+            'applied-address-binding': record.get('address-binding'),
             'allocator-cores': format_cpu_list(claim.get('cores') or []),
             'allocator-policy': claim.get('preemption_policy'),
             'deviations': (list(request.deviations) if request
                            else list(record.get('deviations') or [])),
         })
+    return report
+
+
+def _network_report(host):
+    """Render the discovered Ceph network candidates as plain data."""
+    report = {}
+    for role, network in sorted((host.networks or {}).items()):
+        report[role] = {
+            'source': network.source,
+            'host-address': network.host_address,
+            'candidates': [
+                {'address': c.address, 'interface': c.interface,
+                 'numa-nodes': list(c.nodes)}
+                for c in network.candidates],
+        }
     return report
 
 
@@ -1396,7 +1621,8 @@ def _rollout_inputs():
         host = collect_host_facts()
         return {'osds': [o._asdict() for o in collect_osd_facts()],
                 'nodes': host.nodes, 'interface': host.nic_interface,
-                'nic-nodes': sorted(host.nic_nodes)}
+                'nic-nodes': sorted(host.nic_nodes),
+                'networks': _network_report(host)}
     except TopologyError as exc:
         # Publish a request even when discovery fails, so an unhealthy unit
         # cannot silently disappear from the cohort. Reconcile records it.

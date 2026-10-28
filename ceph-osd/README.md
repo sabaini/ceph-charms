@@ -64,9 +64,13 @@ OSDs on a unit ('unmanaged', 'performance', 'balanced' or 'minimal'). The
 default value is 'unmanaged', which neither calculates nor applies any
 allocation. The charm allocates logical CPUs through the EPA orchestrator,
 enforces them with per-OSD systemd drop-ins, and automatically rolls affected
-OSD restarts across the application's hosts, one host at a time. See
+OSD restarts across the application's hosts, one host at a time. Under
+'performance' and 'balanced', each OSD also uses a public and cluster network
+address on its own NUMA node when the host has a network interface with its
+own address there. See
 [OSD resource allocation profiles][ceph-osd-resource-profiles]
-for the per-profile CPU counts, NUMA alignment rules and lifecycle.
+for the per-profile CPU counts, NUMA alignment rules, network address binding
+and lifecycle.
 
 #### `source`
 

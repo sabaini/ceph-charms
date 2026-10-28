@@ -240,11 +240,36 @@ def device_numa_node(device, root='/'):
     return _numa_node_from_sysfs_path(block, root=root)
 
 
+def _bond_mode(path):
+    """Return the mode of the bond at a sysfs path, or None if not a bond."""
+    mode = _read(os.path.join(path, 'bonding', 'mode'))
+    return mode.split()[0] if mode else None
+
+
+def _lower_interfaces(interface, root='/'):
+    """Return the interfaces an interface sends its traffic through.
+
+    Bonds, bridges and VLANs list theirs as ``lower_*`` links. An
+    active-backup bond with a primary leg sends all traffic over that leg
+    whenever it is up, so only the primary counts.
+
+    :rtype: list[str]
+    """
+    path = os.path.join(root, NET_ROOT, interface)
+    lowers = sorted(os.path.basename(link)[len('lower_'):]
+                    for link in glob.glob(os.path.join(path, 'lower_*')))
+    if _bond_mode(path) == 'active-backup':
+        primary = _read(os.path.join(path, 'bonding', 'primary'))
+        if primary in lowers:
+            return [primary]
+    return lowers
+
+
 def _net_leaf_interfaces(interface, root='/', _seen=None):
     """Resolve an interface to its physical member interfaces.
 
-    Bonds, bridges and VLANs are expanded through their ``lower_*``
-    links; anything with no lower links is treated as a leaf.
+    Bonds, bridges and VLANs are expanded through their lower interfaces;
+    anything with none is treated as a leaf.
 
     :rtype: list[str]
     """
@@ -253,19 +278,17 @@ def _net_leaf_interfaces(interface, root='/', _seen=None):
     if interface in _seen:
         return []
     _seen.add(interface)
-    path = os.path.join(root, NET_ROOT, interface)
-    lowers = sorted(glob.glob(os.path.join(path, 'lower_*')))
+    lowers = _lower_interfaces(interface, root=root)
     if not lowers:
         return [interface]
     leaves = []
     for lower in lowers:
-        name = os.path.basename(lower)[len('lower_'):]
-        leaves.extend(_net_leaf_interfaces(name, root=root, _seen=_seen))
+        leaves.extend(_net_leaf_interfaces(lower, root=root, _seen=_seen))
     return leaves
 
 
 def interface_numa_nodes(interface, root='/'):
-    """Return the NUMA nodes of every physical member of an interface.
+    """Return the NUMA nodes of the physical interfaces carrying its traffic.
 
     :returns: set of NUMA node IDs; empty when unknown (virtual
         interfaces, containers, or hosts without NUMA affinity).
@@ -282,6 +305,41 @@ def interface_numa_nodes(interface, root='/'):
     return nodes
 
 
+def spanning_bonds(interface, root='/'):
+    """Find the bonds that spread an interface's traffic over NUMA nodes.
+
+    These are the bonds, the interface itself or below it, whose legs sit
+    on more than one NUMA node: active-backup bonds without a primary leg
+    and bonds in any mode that uses all legs.
+
+    :returns: ``(bond, mode)`` tuples
+    :rtype: list[tuple[str, str]]
+    """
+    bonds = []
+    seen = set()
+    pending = [interface]
+    while pending:
+        name = pending.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        mode = _bond_mode(os.path.join(root, NET_ROOT, name))
+        if mode and len(interface_numa_nodes(name, root=root)) > 1:
+            bonds.append((name, mode))
+        pending.extend(_lower_interfaces(name, root=root))
+    return bonds
+
+
+def _ip_links():
+    """Return the parsed ``ip -json addr show`` listing, or None."""
+    try:
+        output = subprocess.check_output(
+            ['ip', '-json', 'addr', 'show'], stderr=subprocess.DEVNULL)
+        return json.loads(output.decode('UTF-8'))
+    except (subprocess.CalledProcessError, OSError, ValueError):
+        return None
+
+
 def interface_for_address(address):
     """Return the interface that holds an IP address.
 
@@ -291,17 +349,46 @@ def interface_for_address(address):
     """
     if not address:
         return None
-    try:
-        output = subprocess.check_output(
-            ['ip', '-json', 'addr', 'show'], stderr=subprocess.DEVNULL)
-        links = json.loads(output.decode('UTF-8'))
-    except (subprocess.CalledProcessError, OSError, ValueError):
-        return None
-    for link in links:
+    for link in _ip_links() or []:
         for info in link.get('addr_info', []):
             if info.get('local') == address:
                 return link.get('ifname')
     return None
+
+
+# Address flags that make an address unsuitable for a daemon to bind to.
+UNSTABLE_ADDRESS_FLAGS = ('temporary', 'deprecated', 'tentative', 'dadfailed')
+
+
+def local_addresses(up=True):
+    """Return the host's stable, globally scoped IP addresses.
+
+    Link-local, loopback, privacy (temporary) and not yet usable addresses
+    are excluded. An interface keeps its addresses when it is set down, so
+    the link's ``UP`` flag selects the interfaces. An interface that is up
+    without a carrier, or whose operational state is unknown, counts as up.
+
+    :param up: list the addresses of interfaces that are administratively
+        up, or with False, of those that are down
+    :type up: bool
+    :returns: list of ``(interface, address)`` tuples
+    :rtype: list[tuple[str, str]]
+    """
+    addresses = []
+    for link in _ip_links() or []:
+        interface = link.get('ifname')
+        if ('UP' in (link.get('flags') or ())) != up:
+            continue
+        for info in link.get('addr_info', []):
+            address = info.get('local')
+            if not interface or not address:
+                continue
+            if info.get('scope', 'global') != 'global':
+                continue
+            if any(info.get(flag) for flag in UNSTABLE_ADDRESS_FLAGS):
+                continue
+            addresses.append((interface, address))
+    return addresses
 
 
 def osd_device_map():

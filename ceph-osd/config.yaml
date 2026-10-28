@@ -270,6 +270,11 @@ options:
       .
       If multiple networks are to be used, a space-delimited list of a.b.c.d/x
       can be provided.
+      .
+      With a `performance` or `balanced` performance-profile, an OSD uses an
+      address from these networks on its own NUMA node, when the host has
+      one, instead of the host-wide public address. When unset, the
+      addresses of the `public` binding are used the same way.
   ceph-cluster-network:
     type: string
     default:
@@ -279,6 +284,11 @@ options:
       .
       If multiple networks are to be used, a space-delimited list of a.b.c.d/x
       can be provided.
+      .
+      With a `performance` or `balanced` performance-profile, an OSD uses an
+      address from these networks on its own NUMA node, when the host has
+      one, instead of the host-wide cluster address. When unset, the
+      addresses of the `cluster` binding are used the same way.
   prefer-ipv6:
     type: boolean
     default: False
@@ -500,14 +510,18 @@ options:
       * `performance`: optimise for low latency and high throughput at the
         expense of resource usage. 12 logical CPUs are allocated per
         NVMe/SSD-backed OSD and 4 per HDD-backed OSD, strictly NUMA aligned
-        with the OSD devices, the Ceph network interface and OSD memory. A
-        request that cannot be satisfied strictly is refused and the unit is
-        blocked.
+        with the OSD devices, the Ceph cluster network interface and OSD
+        memory. A request that cannot be satisfied strictly is refused and the
+        unit is blocked.
       * `balanced`: save on resource usage while still providing reasonable
         performance. 8 logical CPUs are allocated per NVMe/SSD-backed OSD and
         2 per HDD-backed OSD, NUMA aligned with the OSD data device and OSD
         memory where possible. Requests that cannot be satisfied are degraded
         with a warning.
+      .
+      Under `performance` and `balanced`, an OSD also uses a public and
+      cluster network address on its own NUMA node, when the host has an
+      interface with its own address there. Every binding decision is logged.
       * `minimal`: optimise for low resource usage. 2 logical CPUs are
         allocated per OSD with no NUMA alignment requested. Requests that
         cannot be satisfied are degraded with a warning.
