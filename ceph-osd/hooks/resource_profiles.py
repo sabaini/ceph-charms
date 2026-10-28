@@ -21,10 +21,13 @@ applying the plan lives in :mod:`resource_apply`.
 
 Only CPU resources are planned in this iteration.  Memory is handled
 solely as a NUMA *locality* hint (systemd ``NUMAPolicy``); no memory
-sizing, hugepages or Ceph settings are computed here.
+sizing, hugepages or Ceph settings are computed here.  The network
+address an OSD binds is chosen to be local to the NUMA node it is pinned
+to, when the host has such an address.
 """
 
 import collections
+import ipaddress
 
 PROFILE_UNMANAGED = 'unmanaged'
 PROFILE_PERFORMANCE = 'performance'
@@ -68,8 +71,47 @@ OsdFacts = collections.namedtuple(
     ['osd_id', 'data_device', 'aux_devices', 'tier', 'data_node',
      'aux_nodes'])
 
+# ``nic_interface`` and ``nic_nodes`` describe the interfaces holding a
+# cluster network address and their NUMA nodes; ``networks`` maps each
+# Ceph network role to its NetworkFacts, or is None when not discovered.
 HostFacts = collections.namedtuple(
-    'HostFacts', ['nodes', 'nic_interface', 'nic_nodes'])
+    'HostFacts', ['nodes', 'nic_interface', 'nic_nodes', 'networks'])
+HostFacts.__new__.__defaults__ = (None,)
+
+# Ceph networks an OSD binds an address on.
+NETWORK_PUBLIC = 'public'
+NETWORK_CLUSTER = 'cluster'
+NETWORK_ROLES = (NETWORK_PUBLIC, NETWORK_CLUSTER)
+
+# A local address an OSD could bind; ``nodes`` is the sorted tuple of its
+# interface's NUMA nodes, empty when unknown; ``note`` explains why the
+# interface spans several nodes, or is None.
+NetworkCandidate = collections.namedtuple(
+    'NetworkCandidate', ['address', 'interface', 'nodes', 'note'])
+NetworkCandidate.__new__.__defaults__ = (None,)
+
+# The candidate addresses of one Ceph network.  ``host_address`` is the
+# address ceph.conf gives every OSD, or None when Ceph selects one itself;
+# ``source`` describes where the candidates came from.
+NetworkFacts = collections.namedtuple(
+    'NetworkFacts', ['role', 'source', 'host_address', 'candidates'])
+
+# Outcomes of choosing the address an OSD binds on one network.
+BIND_LOCAL = 'local'
+BIND_HOST = 'host'
+BIND_REMOTE = 'remote'
+BIND_UNKNOWN = 'unknown'
+BIND_UNPINNED = 'unpinned'
+
+# Outcomes where the OSD keeps an address that is not known to be local.
+BIND_FALLBACKS = frozenset([BIND_REMOTE, BIND_UNKNOWN])
+
+# ``address`` is the address the OSD must bind, or None to keep the host
+# address; ``spanning`` is set when the chosen interface spans NUMA nodes,
+# so the address is not reliably local.
+AddressChoice = collections.namedtuple(
+    'AddressChoice', ['role', 'address', 'outcome', 'message', 'spanning'])
+AddressChoice.__new__.__defaults__ = (False,)
 
 
 def is_managed(profile):
@@ -189,6 +231,143 @@ class Plan(object):
         }
 
 
+def _address_key(address):
+    """Sort key ordering addresses numerically."""
+    parsed = ipaddress.ip_address(address)
+    return (parsed.version, int(parsed))
+
+
+def _describe_candidate(candidate):
+    """Render a candidate address with its interface and NUMA nodes."""
+    if not candidate.nodes:
+        where = 'NUMA node unknown'
+    else:
+        where = 'NUMA node{} {}'.format(
+            's' if len(candidate.nodes) > 1 else '',
+            ','.join(str(n) for n in candidate.nodes))
+    return '{} on {} ({})'.format(
+        candidate.address, candidate.interface, where)
+
+
+def _host_address_text(network):
+    """Describe the address an OSD uses without an override."""
+    if network.host_address:
+        return 'the host {} address {}'.format(
+            network.role, network.host_address)
+    return 'the {} address Ceph selects'.format(network.role)
+
+
+def choose_address(network, node, single_node=False):
+    """Choose the address an OSD binds on one Ceph network.
+
+    The OSD keeps the host address unless a different candidate sits on
+    the NUMA node it is pinned to.  Among local candidates, an interface
+    wholly on that node beats one spanning nodes (such as a cross-socket
+    bond), then the host address wins, then the lowest address.  A choice
+    on a spanning interface is marked, since it is not reliably local.
+
+    :param network: the network's candidate addresses
+    :type network: NetworkFacts
+    :param node: NUMA node the OSD is pinned to, None when unpinned
+    :type node: int or None
+    :param single_node: whether the host has a single NUMA node
+    :type single_node: bool
+    :rtype: AddressChoice
+    """
+    role = network.role
+    host = _host_address_text(network)
+    if node is None:
+        return AddressChoice(
+            role, None, BIND_UNPINNED,
+            'not pinned to a NUMA node; keeping {}'.format(host))
+    if single_node:
+        return AddressChoice(
+            role, None, BIND_HOST,
+            'single NUMA node host; keeping {}'.format(host))
+    local = [c for c in network.candidates if node in c.nodes]
+    if not local:
+        listed = ', '.join(
+            _describe_candidate(c) for c in network.candidates) or 'none'
+        if any(c.nodes for c in network.candidates):
+            return AddressChoice(
+                role, None, BIND_REMOTE,
+                'no {} network address on NUMA node {} (candidates: {}); '
+                'keeping {}'.format(role, node, listed, host))
+        return AddressChoice(
+            role, None, BIND_UNKNOWN,
+            'NUMA node of the {} network interfaces is unknown '
+            '(candidates: {}); keeping {}'.format(role, listed, host))
+    chosen = min(local, key=lambda c: (
+        tuple(c.nodes) != (node,),
+        c.address != network.host_address,
+        _address_key(c.address)))
+    if tuple(chosen.nodes) != (node,):
+        # No interface is wholly on the node; this one only partly is.
+        spans = '{}, which spans NUMA nodes {} and is not reliably local ' \
+            'to node {}{}'.format(
+                chosen.interface, ','.join(str(n) for n in chosen.nodes),
+                node, '; {}'.format(chosen.note) if chosen.note else '')
+        if chosen.address == network.host_address:
+            return AddressChoice(
+                role, None, BIND_HOST,
+                'keeping host {} address {} on {}'.format(
+                    role, chosen.address, spans), True)
+        return AddressChoice(
+            role, chosen.address, BIND_LOCAL,
+            'binding {} address {} (from {}) on {}'.format(
+                role, chosen.address, network.source, spans), True)
+    if chosen.address == network.host_address:
+        return AddressChoice(
+            role, None, BIND_HOST,
+            'host {} address {} on {} is local to NUMA node {}'.format(
+                role, chosen.address, chosen.interface, node))
+    return AddressChoice(
+        role, chosen.address, BIND_LOCAL,
+        'binding {} address {} on {}, local to NUMA node {} '
+        '(from {})'.format(role, chosen.address, chosen.interface, node,
+                           network.source))
+
+
+def choose_addresses(host, node):
+    """Choose an OSD's address on every discovered Ceph network.
+
+    :param host: host topology facts
+    :type host: HostFacts
+    :param node: NUMA node the OSD is pinned to, None when unpinned
+    :type node: int or None
+    :rtype: list[AddressChoice]
+    """
+    networks = host.networks or {}
+    single_node = len(host.nodes) <= 1
+    return [choose_address(networks[role], node, single_node=single_node)
+            for role in NETWORK_ROLES if role in networks]
+
+
+def _public_network_deviation(host, node):
+    """Describe a strict OSD whose public address is not reliably local.
+
+    The strict NIC requirement covers the cluster network.  The public
+    network only warns, since it is commonly one interface shared by the
+    whole host; when it has the same candidates as the cluster network,
+    the cluster check already covers it.
+
+    :rtype: str or None
+    """
+    networks = host.networks or {}
+    public = networks.get(NETWORK_PUBLIC)
+    cluster = networks.get(NETWORK_CLUSTER)
+    if public is None:
+        return None
+    if cluster is not None and (
+            set(c.address for c in cluster.candidates) ==
+            set(c.address for c in public.candidates)):
+        return None
+    choice = choose_address(public, node)
+    if choice.outcome in BIND_FALLBACKS or choice.spanning:
+        return choice.message
+    return None
+
+
 def _target_node(profile, osd, host, deviations, errors):
     """Resolve the NUMA node an OSD should be pinned to.
 
@@ -236,20 +415,29 @@ def _target_node(profile, osd, host, deviations, errors):
             return None
         deviations.append(message)
 
-    # NIC alignment is only a strict-profile requirement.
+    # NIC alignment is only a strict-profile requirement.  Any interface
+    # holding a cluster network address on the OSD's node satisfies it;
+    # one that also spans other nodes only with a deviation.
     if is_strict(profile):
         if not host.nic_nodes:
             deviations.append(
-                'NUMA node of Ceph network interface {} is unknown; '
-                'NIC alignment not verified'.format(
+                'NUMA node of Ceph cluster network interfaces ({}) is '
+                'unknown; NIC alignment not verified'.format(
                     host.nic_interface or 'unknown'))
         elif node not in host.nic_nodes:
             errors.append(
-                'data device {} is on node {} but Ceph network interface '
-                '{} is on node(s) {}'.format(
+                'data device {} is on node {} but Ceph cluster network '
+                'interfaces ({}) are on node(s) {}'.format(
                     osd.data_device, node, host.nic_interface,
                     ','.join(str(n) for n in sorted(host.nic_nodes))))
             return None
+        elif NETWORK_CLUSTER in (host.networks or {}):
+            choice = choose_address(host.networks[NETWORK_CLUSTER], node)
+            if choice.spanning:
+                deviations.append(choice.message)
+        deviation = _public_network_deviation(host, node)
+        if deviation:
+            deviations.append(deviation)
     return node
 
 
