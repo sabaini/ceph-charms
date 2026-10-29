@@ -118,6 +118,108 @@ python3 -m unittest discover -s ceph-osd/unit_tests \
   -p test_resource_profile_functest.py -v
 ```
 
+## NUMA-local network binding
+
+`tests/network_binding.py` is a second disruptive, opt-in scenario. It needs a
+host topology that a bundle cannot create, so it only runs against an existing
+disposable model.
+
+### Coverage
+
+The expected addresses of each OSD come from `resource-allocation-status`
+(`applied-*-addr`, or the host-wide address). They must match the desired
+addresses, except for the documented `balanced` fallback: an OSD planned for a
+NUMA node that was allocated on any node, or left unpinned, keeps the
+host-wide addresses. On the hosts and in the cluster the test then checks:
+
+- `CEPH_ARGS` in the drop-in and in the running daemon's environment;
+- the effective `public_addr`, `cluster_addr` and `ms_bind_before_connect`,
+  read through the admin socket;
+- that the OSD listens only on its expected addresses, that the OSD map
+  advertises them, and that every advertised endpoint accepts a TCP
+  connection from the MON unit (public) and from another OSD unit, or the MON
+  unit when there is none (cluster);
+- for OSDs with a per-node address, that every connection the OSD opens
+  leaves from one of its own addresses, and its monitor session from its
+  public address.
+
+The scenario:
+
+1. Applies `balanced` (`TEST_NETWORK_PROFILE=performance` for the strict
+   profile) and verifies the baseline. At least one OSD must use a per-node
+   address.
+2. Narrows `ceph-cluster-network` (or `ceph-public-network` when only the
+   public address is per-node) to the subnet of the host-wide address, then
+   restores it. Its other address stays per-node. The option applies to
+   every OSD, so in each direction exactly the OSDs whose binding changes
+   restart, and no OSD's CPUs change. The step is skipped with a warning
+   when the per-node address is in the same subnet.
+3. Moves to `minimal`, where every OSD uses the host-wide addresses, and back.
+4. Adds `CEPH_ARGS=--public_addr=<host address>` to `/etc/default/ceph`,
+   which systemd lets override the drop-in, and restarts that OSD:
+   `update-status` must block the unit. Removing the line and restarting the
+   OSD again clears the block.
+
+Administratively down interfaces are covered by the discovery and
+reconciliation unit tests instead: systemd-networkd removes the addresses of
+an interface that is set down, so that case cannot be staged reliably here.
+
+### Topology
+
+The model needs an OSD host with at least two NUMA nodes, and an OSD whose
+device is on a node with an interface holding an address of its own in
+`ceph-public-network`/`ceph-cluster-network`, or in the `public`/`cluster`
+bindings. That address needs source-based routing, as described under
+*Network requirements* in `ceph-osd/RESOURCE-PROFILES.md`.
+
+Without such hardware, `emulate-numa-network.sh` builds one from an LXD VM.
+The LXD host needs two NUMA nodes. Pick CPUs for the VM from both nodes
+(`/sys/devices/system/node/node*/cpulist`); here node 0 holds 0-11 and
+node 1 holds 12-23:
+
+```sh
+juju add-model numa-net
+juju model-config default-base=ubuntu@24.04
+juju add-machine --constraints "virt-type=virtual-machine cores=16 mem=16G root-disk=40G"
+# Use machine 0's LXD instance name, from `juju status`.
+ceph-osd/tests/resource-profiles/emulate-numa-network.sh juju-0a1b2c-0 4-11,16-23
+juju add-machine    # a container for the MON
+juju deploy ceph-mon --channel squid/edge --to 1 --config source=distro \
+    --config monitor-count=1 --config expected-osd-count=2
+juju deploy "$TEST_EPA_OSD_CHARM" ceph-osd --to 0 \
+    --resource epa-orchestrator="$TEST_EPA_SNAP" --config source=distro \
+    --config performance-profile=balanced \
+    --config osd-devices="/dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_lxd_osd--n0 /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_lxd_osd--n1" \
+    --config ceph-public-network="<LXD bridge subnet> 10.77.1.0/24"
+juju integrate ceph-osd:mon ceph-mon:osd
+```
+
+The script gives the VM a second NIC on its own LXD bridge (`10.77.1.10`,
+routed through `10.77.1.1` by source), an NVMe disk on each node, and a boot
+service that reports the second NIC and the `osd-n1` disk on node 1. The
+cluster network follows the `cluster` binding, so the OSD on the `osd-n1` disk
+binds both of its addresses to `10.77.1.10`.
+
+### Run
+
+From `ceph-osd/`:
+
+```sh
+functest-test --model lxd-controller:numa-net \
+  --test-directory tests/resource-profiles \
+  --tests tests.network_binding.NetworkBindingTest
+```
+
+Evidence goes to a `network-<id>` directory beneath `TEST_EPA_ARTIFACTS`: the
+allocation status and network probe of every step. Cleanup removes the
+`/etc/default/ceph` line, restarts that OSD and restores every changed option.
+The oracle has unit tests:
+
+```sh
+python3 -m unittest discover -s ceph-osd/unit_tests \
+  -p test_network_binding_functest.py -v
+```
+
 ## EPA source compatibility check
 
 The socket contract check runs without Juju, a snap installation, or live OSDs.

@@ -19,6 +19,7 @@ import glob
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -86,6 +87,95 @@ def snapshot():
     return result
 
 
+def tcp_sockets():
+    """Map process IDs to their listening and established TCP endpoints."""
+    result = {}
+    for line in command('ss', '-Htanp').splitlines():
+        fields = line.split()
+        if len(fields) < 6:
+            continue
+        state, local, peer = fields[0], fields[3], fields[4]
+        for pid in re.findall(r'pid=(\d+),', line):
+            entry = result.setdefault(
+                pid, {'listening': [], 'established': []})
+            if state == 'LISTEN':
+                entry['listening'].append(local)
+            elif state == 'ESTAB':
+                entry['established'].append([local, peer])
+    return result
+
+
+def daemon_config(osd, option):
+    """Read one effective option through the OSD's admin socket."""
+    try:
+        return json.loads(command('ceph', 'daemon', 'osd.' + osd, 'config',
+                                  'get', option))[option]
+    except (subprocess.CalledProcessError, ValueError, KeyError):
+        return None
+
+
+def network():
+    """Capture each OSD's configured, effective and observed addresses."""
+    sockets = tcp_sockets()
+    result = {'hostname': socket.gethostname(), 'interfaces': {
+        link['ifname']: {'flags': link.get('flags', []), 'addresses': [
+            '{}/{}'.format(a['local'], a['prefixlen'])
+            for a in link.get('addr_info', [])]}
+        for link in json.loads(command('ip', '-json', 'addr', 'show'))},
+        'osds': {}}
+    for directory in sorted(glob.glob('/var/lib/ceph/osd/ceph-*')):
+        osd = directory.rsplit('-', 1)[1]
+        service = 'ceph-osd@{}.service'.format(osd)
+        pid = command('systemctl', 'show', service, '--property=MainPID',
+                      '--value').strip()
+        dropin = Path('/etc/systemd/system/{}.d/'
+                      '50-charm-resource-profile.conf'.format(service))
+        environment = Path('/proc/{}/environ'.format(pid))
+        ceph_args = None
+        if pid != '0' and environment.exists():
+            for item in environment.read_bytes().decode().split('\0'):
+                if item.startswith('CEPH_ARGS='):
+                    ceph_args = item.split('=', 1)[1]
+        result['osds'][osd] = dict(
+            sockets.get(pid, {'listening': [], 'established': []}),
+            pid=pid, dropin=dropin.read_text() if dropin.exists() else None,
+            ceph_args=ceph_args, config={
+                option: daemon_config(osd, option) for option in (
+                    'public_addr', 'cluster_addr',
+                    'ms_bind_before_connect')})
+    return result
+
+
+def advertised():
+    """Read the addresses the cluster map advertises, from a MON unit."""
+    def addresses(vector):
+        return [entry['addr'] for entry in vector.get('addrvec', [])]
+    osds = json.loads(command('ceph', 'osd', 'dump', '--format=json'))
+    mons = json.loads(command('ceph', 'mon', 'dump', '--format=json'))
+    return {
+        'osds': {str(osd['osd']): {
+            'up': osd['up'], 'public': addresses(osd['public_addrs']),
+            'cluster': addresses(osd['cluster_addrs'])}
+            for osd in osds['osds']},
+        'mons': [address for mon in mons['mons']
+                 for address in addresses(mon['public_addrs'])],
+    }
+
+
+def connect(*endpoints):
+    """Open a TCP connection to each ``address:port``; map to any error."""
+    result = {}
+    for endpoint in endpoints:
+        host, _, port = endpoint.rpartition(':')
+        try:
+            with socket.create_connection((host.strip('[]'), int(port)),
+                                          timeout=5):
+                result[endpoint] = None
+        except OSError as exc:
+            result[endpoint] = str(exc)
+    return result
+
+
 def markers():
     """Read the rollout handoff keys from a MON unit."""
     # One bounded command, independent of how many old generations exist.
@@ -109,6 +199,12 @@ if __name__ == '__main__':
         output = markers()
     elif sys.argv[1] == 'journal':
         output = journal(sys.argv[2])
+    elif sys.argv[1] == 'network':
+        output = network()
+    elif sys.argv[1] == 'advertised':
+        output = advertised()
+    elif sys.argv[1] == 'connect':
+        output = connect(*sys.argv[2:])
     else:
         raise ValueError('Unknown probe: ' + sys.argv[1])
     print(json.dumps(output, sort_keys=True))

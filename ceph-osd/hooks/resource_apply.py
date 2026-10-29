@@ -19,14 +19,20 @@ responsible for enforcement.  Enforcement is a systemd drop-in per OSD
 instance carrying ``CPUAffinity`` (and, for NUMA-aligned profiles, a
 memory ``NUMAPolicy``), which survives reboots and OSD restarts.
 
+When the OSD's NUMA node has its own public or cluster network address,
+the drop-in also passes that address to the daemon through ``CEPH_ARGS``,
+and makes the daemon use it as the source of the connections it opens.
+
 Drop-ins take effect on the next start of the unit, so a change is
 followed immediately by a restart of the affected OSD.  Ceph's own NUMA
 affinity must be disabled while an allocation is applied; otherwise it can
 widen the process affinity after systemd has started the daemon.
 """
 
+import ipaddress
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -105,6 +111,22 @@ READY_STATE = 'active'
 RESTART_TIMEOUT = 300
 RESTART_POLL_INTERVAL = 5
 
+# Allocation keys holding the address an OSD binds, with their Ceph option.
+ADDRESS_OPTIONS = (
+    ('public-addr', 'public_addr'),
+    ('cluster-addr', 'cluster_addr'),
+)
+
+# Binds outgoing sockets to the messenger's address, so that connections the
+# OSD opens (to monitors, managers and peer OSDs) leave from it as well.
+BIND_BEFORE_CONNECT = 'ms_bind_before_connect'
+
+# An entity_addr_t as Ceph prints it, e.g. ``v2:10.0.0.5:0/0`` or
+# ``v2:[fd00::5]:0/0``.
+ENTITY_ADDR = re.compile(
+    r'^(?:(?:v1|v2|any):)?'
+    r'(?:\[(?P<v6>[0-9a-f:.]+)\]|(?P<v4>[0-9.]+)):\d+/\d+$')
+
 
 class ApplyError(Exception):
     """Raised when an allocation could not be enforced."""
@@ -123,7 +145,19 @@ def _application_name():
         return 'ceph-osd'
 
 
-def render_dropin(profile, cores, numa_policy=None, numa_node=None):
+def allocation_addresses(allocation):
+    """Return the per-OSD address overrides of an allocation or record.
+
+    :returns: mapping of allocation key (``public-addr``/``cluster-addr``)
+        to address, omitting addresses left to ceph.conf
+    :rtype: dict[str, str]
+    """
+    return dict((key, allocation[key]) for key, _ in ADDRESS_OPTIONS
+                if allocation.get(key))
+
+
+def render_dropin(profile, cores, numa_policy=None, numa_node=None,
+                  addresses=None):
     """Render the systemd drop-in enforcing one OSD's allocation.
 
     :param profile: active profile name, recorded as a comment
@@ -135,16 +169,29 @@ def render_dropin(profile, cores, numa_policy=None, numa_node=None):
     :type numa_policy: str or None
     :param numa_node: NUMA node for NUMAMask, or None to omit
     :type numa_node: int or None
+    :param addresses: per-OSD address overrides, keyed like
+        :func:`allocation_addresses`
+    :type addresses: dict[str, str] or None
     :rtype: str
     """
     if isinstance(cores, str):
         cores = parse_cpu_list(cores)
+    addresses = addresses or {}
     lines = [HEADER.format(profile=profile), '[Service]\n']
     # This must beat /etc/ceph/ceph.conf alternatives from co-located charms.
     # CEPH_CONF is consumed by Ceph before its default config-file search.
     lines.append(
         'Environment="CEPH_CONF=/var/lib/charm/{}/ceph.conf"\n'.format(
             _application_name()))
+    # Ceph daemons parse CEPH_ARGS as command line options, which take
+    # precedence over the host-wide public/cluster addr in ceph.conf.
+    args = ['--{}={}'.format(option, addresses[key])
+            for key, option in ADDRESS_OPTIONS if addresses.get(key)]
+    if args:
+        # Without this, the kernel picks the source of outgoing connections
+        # by destination, typically the host-wide address's interface.
+        args.append('--{}=true'.format(BIND_BEFORE_CONNECT))
+        lines.append('Environment="CEPH_ARGS={}"\n'.format(' '.join(args)))
     # systemd merges list assignments across the unit and its drop-ins; an
     # empty assignment discards any mask set before this drop-in.
     lines.append('CPUAffinity=\n')
@@ -263,8 +310,40 @@ def _daemon_config_value(osd_id, option):
         return None
 
 
-def verify_enforcement(osd_id, cores):
-    """Raise when Ceph did not retain the CPU boundary after restart."""
+def _parse_entity_address(value):
+    """Return the IP address of a Ceph entity address, or None."""
+    match = ENTITY_ADDR.match((value or '').strip().lower())
+    if not match:
+        return None
+    try:
+        return ipaddress.ip_address(match.group('v6') or match.group('v4'))
+    except ValueError:
+        return None
+
+
+def verify_addresses(osd_id, addresses):
+    """Raise when a running OSD does not use its address overrides."""
+    overridden = False
+    for key, option in ADDRESS_OPTIONS:
+        expected = addresses.get(key)
+        if not expected:
+            continue
+        overridden = True
+        actual = _daemon_config_value(osd_id, option)
+        if _parse_entity_address(actual) != ipaddress.ip_address(expected):
+            raise ApplyError(
+                'osd.{} runs with {}={!r} instead of {}'.format(
+                    osd_id, option, actual, expected))
+    if overridden:
+        actual = _daemon_config_value(osd_id, BIND_BEFORE_CONNECT)
+        if actual != 'true':
+            raise ApplyError(
+                'osd.{} runs with {}={!r} instead of true'.format(
+                    osd_id, BIND_BEFORE_CONNECT, actual))
+
+
+def verify_enforcement(osd_id, cores, addresses=None):
+    """Raise when Ceph did not retain the drop-in's settings after restart."""
     auto = _daemon_config_value(osd_id, 'osd_numa_auto_affinity')
     node = _daemon_config_value(osd_id, 'osd_numa_node')
     if auto not in ('false', '0') or node != '-1':
@@ -292,6 +371,40 @@ def verify_enforcement(osd_id, cores):
         raise ApplyError(
             'osd.{} thread affinity escapes {} (threads: {})'.format(
                 osd_id, expected, ', '.join(sorted(mismatched))))
+    verify_addresses(osd_id, addresses or {})
+
+
+def _running_pid(osd_id):
+    """Return the OSD's main PID while its admin socket answers, or None."""
+    pid = _unit_main_pid(osd_id)
+    if pid and _osd_state(osd_id) is not None:
+        return pid
+    return None
+
+
+def verify_running(osd_id, cores, addresses=None):
+    """Verify an OSD's enforcement unless the daemon is not running.
+
+    A stopped, failed or restarting OSD has no effective settings to read,
+    and it applies its drop-in when it starts. Reporting it as a mismatch
+    would block the unit until the next check.
+
+    :returns: whether the OSD was running for the whole check
+    :rtype: bool
+    :raises ApplyError: the running daemon does not match its allocation
+    """
+    pid = _running_pid(osd_id)
+    if pid is not None:
+        try:
+            verify_enforcement(osd_id, cores, addresses=addresses)
+            return True
+        except ApplyError:
+            # Only a daemon that stayed up throughout can be judged.
+            if _running_pid(osd_id) == pid:
+                raise
+    log('osd.{} is not running; its allocation is verified once it is '
+        'up'.format(osd_id), level=INFO)
+    return False
 
 
 def _osd_state(osd_id):
@@ -369,7 +482,8 @@ def apply_allocations(profile, allocations, restart_timeout=RESTART_TIMEOUT,
     :param profile: active profile name
     :type profile: str
     :param allocations: per-OSD allocation dicts, each with ``osd-id``,
-        ``cores``, ``numa-policy`` and ``numa-node`` keys
+        ``cores``, ``numa-policy`` and ``numa-node`` keys, and optionally
+        ``public-addr`` and ``cluster-addr`` overrides
     :type allocations: list[dict]
     :param force_osd_ids: OSD IDs requiring restart even with matching bytes
     :type force_osd_ids: iterable[str]
@@ -389,7 +503,8 @@ def apply_allocations(profile, allocations, restart_timeout=RESTART_TIMEOUT,
             profile,
             allocation['cores'],
             numa_policy=allocation.get('numa-policy'),
-            numa_node=allocation.get('numa-node'))
+            numa_node=allocation.get('numa-node'),
+            addresses=allocation_addresses(allocation))
         if (read_dropin(osd_id) != content or
                 osd_id in pending_restarts() or osd_id in force_osd_ids):
             # Persist before writing: a failed restart or interrupted hook
@@ -401,14 +516,17 @@ def apply_allocations(profile, allocations, restart_timeout=RESTART_TIMEOUT,
     if not changed:
         if verify_unchanged:
             for allocation in allocations:
-                verify_enforcement(
-                    allocation['osd-id'], allocation['cores'])
+                verify_running(
+                    allocation['osd-id'], allocation['cores'],
+                    addresses=allocation_addresses(allocation))
         return []
     daemon_reload()
     restarted = []
     for osd_id in changed:
         restart_osd(osd_id, timeout=restart_timeout)
-        verify_enforcement(osd_id, allocation_by_id[osd_id]['cores'])
+        allocation = allocation_by_id[osd_id]
+        verify_enforcement(osd_id, allocation['cores'],
+                           addresses=allocation_addresses(allocation))
         _pending(osd_id, False)
         restarted.append(osd_id)
     return restarted
