@@ -20,6 +20,7 @@ import unittest
 from unittest.mock import patch
 
 import epa_client
+import host_topology
 import resource_manager
 import resource_profiles as rp
 
@@ -205,6 +206,10 @@ class ManagerTestCase(unittest.TestCase):
         patcher = patch.object(resource_manager.resource_apply,
                                'verify_enforcement')
         self.verify_enforcement = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(resource_manager.resource_apply,
+                               'verify_running', return_value=True)
+        self.verify_running = patcher.start()
         self.addCleanup(patcher.stop)
         patcher = patch.object(resource_manager, '_rollout_inputs',
                                return_value={})
@@ -1798,12 +1803,30 @@ class VerifyTestCase(ManagerTestCase):
         expected = resource_manager.resource_apply.render_dropin(
             rp.PROFILE_BALANCED, '4-11', numa_policy='preferred',
             numa_node=0)
-        self.verify_enforcement.side_effect = resource_manager.resource_apply.\
+        self.verify_running.side_effect = resource_manager.resource_apply.\
             ApplyError('osd.0 has conflicting Ceph NUMA affinity settings')
         with patch.object(resource_manager.resource_apply, 'read_dropin',
                           return_value=expected):
             drift = resource_manager.verify(client_factory=lambda: epa)
         self.assertIn('conflicting Ceph NUMA affinity settings', drift[0])
+
+    def test_stopped_osd_is_not_drift(self):
+        self.kv.set(resource_manager.STATE_KEY, self.applied_state())
+        claimed = FakeEpa(range(0, 16), TWO_NODES,
+                          foreign={'ceph-osd.0': list(range(4, 12))})
+        expected = resource_manager.resource_apply.render_dropin(
+            rp.PROFILE_BALANCED, '4-11', numa_policy='preferred',
+            numa_node=0)
+        self.verify_running.return_value = False
+        with patch.object(resource_manager.resource_apply, 'read_dropin',
+                          return_value=expected):
+            self.assertEqual(
+                resource_manager.verify(client_factory=lambda: claimed), [])
+            # The drop-in and the claim are still checked.
+            drift = resource_manager.verify(
+                client_factory=lambda: FakeEpa(range(0, 16), TWO_NODES))
+        self.assertEqual(len(drift), 1)
+        self.assertIn('no longer records a CPU claim', drift[0])
 
     def test_changed_claim_is_drift(self):
         self.kv.set(resource_manager.STATE_KEY, self.applied_state())
@@ -2076,6 +2099,53 @@ class SafeWrapperTestCase(ManagerTestCase):
             self.assertFalse(resource_manager.safe_release_osd('0'))
 
 
+def collect(addresses, interface_nodes, host_addresses, bindings=None,
+            down=(), bonds=None):
+    """Collect host facts from fixed local addresses and bindings.
+
+    The addresses are listed as ``ip -json addr show`` would; ``down``
+    holds those of interfaces that are set down; ``bonds`` maps an
+    interface to the bonds spreading it over NUMA nodes.
+    """
+    links = {}
+    for flags, listed in ((['BROADCAST', 'UP', 'LOWER_UP'], addresses),
+                          (['BROADCAST'], down)):
+        for interface, address in listed:
+            links.setdefault(interface, {
+                'ifname': interface, 'flags': flags, 'addr_info': [],
+            })['addr_info'].append({'local': address, 'scope': 'global'})
+
+    def network_get(role):
+        if bindings is None:
+            raise NotImplementedError('network-get is not available')
+        return {'bind-addresses': [{
+            'interface-name': 'ignored',
+            'addresses': [{'value': a} for a in bindings.get(role, [])],
+        }]}
+
+    def host_address(role):
+        address = host_addresses.get(role)
+        if isinstance(address, Exception):
+            raise address
+        return address
+
+    with patch.object(resource_manager, 'numa_nodes',
+                      return_value=TWO_NODES), \
+            patch.object(host_topology, '_ip_links',
+                         return_value=list(links.values())), \
+            patch.object(resource_manager, 'interface_numa_nodes',
+                         side_effect=lambda i, root='/': set(
+                             interface_nodes.get(i, ()))), \
+            patch.object(resource_manager, 'spanning_bonds',
+                         side_effect=lambda i, root='/': list(
+                             (bonds or {}).get(i, ()))), \
+            patch.object(resource_manager, '_host_address',
+                         side_effect=host_address), \
+            patch.object(resource_manager, 'network_get',
+                         side_effect=network_get):
+        return resource_manager.collect_host_facts()
+
+
 class CollectorTestCase(ManagerTestCase):
 
     def test_collect_osd_facts(self):
@@ -2098,39 +2168,471 @@ class CollectorTestCase(ManagerTestCase):
         self.assertEqual(facts[1].tier, rp.TIER_HDD)
         self.assertEqual(facts[1].data_node, 0)
 
-    def test_collect_host_facts(self):
-        with patch.object(resource_manager, 'numa_nodes') as nodes, \
-                patch.object(resource_manager, 'ceph_network_address',
-                             return_value='10.0.0.5'), \
-                patch.object(resource_manager,
-                             'interface_for_address') as lookup, \
-                patch.object(resource_manager,
-                             'interface_numa_nodes') as nic_nodes:
-            nodes.return_value = TWO_NODES
-            lookup.return_value = 'bond0'
-            nic_nodes.return_value = set([1])
-            facts = resource_manager.collect_host_facts()
-        self.assertEqual(facts.nodes, TWO_NODES)
-        self.assertEqual(facts.nic_interface, 'bond0')
-        self.assertEqual(facts.nic_nodes, set([1]))
+    ADDRESSES = [
+        ('eno1', '192.168.0.5'),
+        ('ens1f0', '10.0.0.5'),
+        ('ens1f0', 'fd00::5'),
+        ('ens2f0', '10.0.1.5'),
+        ('ens1f1', '10.1.0.5'),
+        ('ens2f1', '10.1.1.5'),
+    ]
+    INTERFACE_NODES = {'eno1': (0,), 'ens1f0': (0,), 'ens2f0': (1,),
+                       'ens1f1': (0,), 'ens2f1': (1,)}
+    HOST_ADDRESSES = {'public': '10.0.0.5', 'cluster': '10.1.0.5'}
 
-    def test_collect_host_facts_without_an_interface(self):
-        with patch.object(resource_manager, 'numa_nodes') as nodes, \
-                patch.object(resource_manager, 'ceph_network_address',
-                             return_value='10.0.0.5'), \
-                patch.object(resource_manager,
-                             'interface_for_address') as lookup:
-            nodes.return_value = {0: [0, 1]}
-            lookup.return_value = None
-            facts = resource_manager.collect_host_facts()
-        self.assertEqual(facts.nic_nodes, set())
-        self.assertIsNone(facts.nic_interface)
+    def test_collect_host_facts_from_configured_networks(self):
+        self.config['ceph-public-network'] = '10.0.0.0/24 10.0.1.0/24'
+        self.config['ceph-cluster-network'] = '10.1.0.0/23'
+        facts = collect(self.ADDRESSES, self.INTERFACE_NODES,
+                        self.HOST_ADDRESSES)
+        self.assertEqual(facts.nodes, TWO_NODES)
+        public = facts.networks[rp.NETWORK_PUBLIC]
+        self.assertEqual(public.source, 'ceph-public-network')
+        self.assertEqual(public.host_address, '10.0.0.5')
+        self.assertEqual(public.candidates, (
+            rp.NetworkCandidate('10.0.0.5', 'ens1f0', (0,)),
+            rp.NetworkCandidate('10.0.1.5', 'ens2f0', (1,))))
+        cluster = facts.networks[rp.NETWORK_CLUSTER]
+        self.assertEqual(cluster.source, 'ceph-cluster-network')
+        self.assertEqual([c.address for c in cluster.candidates],
+                         ['10.1.0.5', '10.1.1.5'])
+        # The strict NIC check covers every cluster network interface.
+        self.assertEqual(facts.nic_interface, 'ens1f1,ens2f1')
+        self.assertEqual(facts.nic_nodes, set([0, 1]))
+
+    # ens2f1, the cluster NIC on node 1, set down with its address kept.
+    UP_ADDRESSES = [a for a in ADDRESSES if a[0] != 'ens2f1']
+    DOWN_ADDRESSES = [('ens2f1', '10.1.1.5')]
+
+    def test_collect_host_facts_ignores_interfaces_set_down(self):
+        self.config['ceph-cluster-network'] = '10.1.0.0/23'
+        with patch.object(resource_manager, 'log') as log:
+            facts = collect(self.UP_ADDRESSES, self.INTERFACE_NODES,
+                            self.HOST_ADDRESSES, down=self.DOWN_ADDRESSES)
+        self.assertEqual(facts.networks[rp.NETWORK_CLUSTER].candidates, (
+            rp.NetworkCandidate('10.1.0.5', 'ens1f1', (0,)),))
+        # The strict NIC check does not count it either.
+        self.assertEqual(facts.nic_interface, 'ens1f1')
+        self.assertEqual(facts.nic_nodes, set([0]))
+        log.assert_any_call(
+            'Ignoring Ceph cluster network address 10.1.1.5 on ens2f1: the '
+            'interface is administratively down', level=resource_manager.INFO)
+
+        # Juju bindings are filtered the same way.
+        del self.config['ceph-cluster-network']
+        facts = collect(self.UP_ADDRESSES, self.INTERFACE_NODES,
+                        self.HOST_ADDRESSES, down=self.DOWN_ADDRESSES,
+                        bindings={'public': ['10.0.0.5'],
+                                  'cluster': ['10.1.0.5', '10.1.1.5']})
+        self.assertEqual(
+            [c.address for c in
+             facts.networks[rp.NETWORK_CLUSTER].candidates], ['10.1.0.5'])
+
+    def test_collect_host_facts_from_bindings(self):
+        facts = collect(
+            self.ADDRESSES, self.INTERFACE_NODES, self.HOST_ADDRESSES,
+            bindings={'public': ['10.0.0.5', '10.0.1.5'],
+                      'cluster': ['10.1.0.5', '10.1.1.5', '10.9.9.9']})
+        public = facts.networks[rp.NETWORK_PUBLIC]
+        self.assertEqual(public.source, "the 'public' binding")
+        self.assertEqual([c.address for c in public.candidates],
+                         ['10.0.0.5', '10.0.1.5'])
+        # A binding address that is not local is not a candidate.
+        self.assertEqual(
+            [c.address for c in
+             facts.networks[rp.NETWORK_CLUSTER].candidates],
+            ['10.1.0.5', '10.1.1.5'])
+
+    def test_collect_host_facts_without_bindings_uses_the_host_address(self):
+        facts = collect(self.ADDRESSES, self.INTERFACE_NODES,
+                        self.HOST_ADDRESSES)
+        public = facts.networks[rp.NETWORK_PUBLIC]
+        self.assertEqual(public.source, 'the host address')
+        self.assertEqual(public.candidates, (
+            rp.NetworkCandidate('10.0.0.5', 'ens1f0', (0,)),))
+        self.assertEqual(facts.nic_interface, 'ens1f1')
+        self.assertEqual(facts.nic_nodes, set([0]))
+
+    def test_collect_host_facts_keeps_the_host_address_family(self):
+        facts = collect(
+            self.ADDRESSES + [('ens2f0', 'fd00::6')], self.INTERFACE_NODES,
+            {'public': 'fd00::5', 'cluster': 'fd00::5'},
+            bindings={'public': ['10.0.0.5', 'fd00::5', 'fd00::6'],
+                      'cluster': []})
+        self.assertEqual(
+            [c.address for c in facts.networks[rp.NETWORK_PUBLIC].candidates],
+            ['fd00::5', 'fd00::6'])
+
+    # The cluster network on bonds whose legs sit on both sockets.
+    BONDED_ADDRESSES = [
+        ('ens1f0', '10.0.0.5'),
+        ('ens2f0', '10.0.1.5'),
+        ('bond0.20', '10.1.0.5'),
+        ('bond1', '10.1.1.5'),
+    ]
+    BONDED_NODES = {'ens1f0': (0,), 'ens2f0': (1,), 'bond0.20': (0, 1),
+                    'bond1': (0, 1)}
+    BONDS = {'bond0.20': [('bond0', 'active-backup')],
+             'bond1': [('bond1', '802.3ad')]}
+
+    def test_collect_host_facts_explains_spanning_bonds(self):
+        self.config['ceph-public-network'] = '10.0.0.0/23'
+        self.config['ceph-cluster-network'] = '10.1.0.0/23'
+        facts = collect(self.BONDED_ADDRESSES, self.BONDED_NODES,
+                        self.HOST_ADDRESSES, bonds=self.BONDS)
+        self.assertEqual(facts.networks[rp.NETWORK_CLUSTER].candidates, (
+            rp.NetworkCandidate(
+                '10.1.0.5', 'bond0.20', (0, 1),
+                'bond0 is an active-backup bond without a primary leg, so '
+                'its traffic uses whichever leg is active; set a primary '
+                "leg to make it local to that leg's node"),
+            rp.NetworkCandidate(
+                '10.1.1.5', 'bond1', (0, 1),
+                'bond1 is a bond in 802.3ad mode, which uses all its legs')))
+        self.assertEqual(
+            [c.note for c in facts.networks[rp.NETWORK_PUBLIC].candidates],
+            [None, None])
+
+    def test_collect_host_facts_ignores_invalid_networks(self):
+        self.config['ceph-public-network'] = 'bogus 10.0.1.0/24'
+        facts = collect(self.ADDRESSES, self.INTERFACE_NODES,
+                        self.HOST_ADDRESSES)
+        self.assertEqual(
+            [c.address for c in facts.networks[rp.NETWORK_PUBLIC].candidates],
+            ['10.0.0.5', '10.0.1.5'])
 
     def test_collect_host_facts_without_an_address(self):
-        with patch.object(resource_manager, 'numa_nodes') as nodes, \
-                patch.object(resource_manager, 'ceph_network_address') as get:
-            nodes.return_value = {0: [0, 1]}
-            get.side_effect = RuntimeError('no network binding')
-            facts = resource_manager.collect_host_facts()
+        error = RuntimeError('no network binding')
+        facts = collect([], {}, {'public': error, 'cluster': error})
+        self.assertIsNone(facts.networks[rp.NETWORK_CLUSTER].host_address)
         self.assertEqual(facts.nic_nodes, set())
         self.assertIsNone(facts.nic_interface)
+
+
+class HostAddressTestCase(ManagerTestCase):
+
+    def test_host_addresses_follow_ceph_conf(self):
+        with patch('utils.get_public_addr', return_value='10.0.0.5'), \
+                patch('utils.get_cluster_addr', return_value='10.1.0.5'):
+            self.assertEqual(resource_manager._host_address('public'),
+                             '10.0.0.5')
+            self.assertEqual(resource_manager._host_address('cluster'),
+                             '10.1.0.5')
+
+    def test_ipv6_host_address(self):
+        self.config['prefer-ipv6'] = True
+        with patch('utils.get_networks', return_value=[]), \
+                patch('utils.get_ipv6_addr', return_value=['fd00::5']):
+            self.assertEqual(resource_manager._host_address('public'),
+                             'fd00::5')
+
+    def test_ipv6_network_leaves_the_address_to_ceph(self):
+        self.config['prefer-ipv6'] = True
+        with patch('utils.get_networks', return_value=['fd00::/64']):
+            self.assertIsNone(resource_manager._host_address('public'))
+
+
+def per_socket_networks(public_nodes=(0, 1), cluster_nodes=(0, 1)):
+    """Host facts with a public and a cluster NIC on the given nodes."""
+    def network(role, prefix, nodes):
+        candidates = tuple(
+            rp.NetworkCandidate('{}.{}.5'.format(prefix, node),
+                                'ens{}f{}'.format(node + 1,
+                                                  int(role == 'cluster')),
+                                (node,))
+            for node in nodes)
+        return rp.NetworkFacts(role=role,
+                               source='ceph-{}-network'.format(role),
+                               host_address='{}.0.5'.format(prefix),
+                               candidates=candidates)
+
+    public = network(rp.NETWORK_PUBLIC, '10.0', public_nodes)
+    cluster = network(rp.NETWORK_CLUSTER, '10.1', cluster_nodes)
+    return rp.HostFacts(
+        nodes=TWO_NODES,
+        nic_interface=','.join(c.interface for c in cluster.candidates),
+        nic_nodes=set(cluster_nodes),
+        networks={rp.NETWORK_PUBLIC: public, rp.NETWORK_CLUSTER: cluster})
+
+
+class AddressBindingTestCase(ManagerTestCase):
+
+    def setUp(self):
+        super(AddressBindingTestCase, self).setUp()
+        patcher = patch.object(resource_manager, 'log')
+        self.log = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def reconcile_with(self, profile, osds, host):
+        self.config['performance-profile'] = profile
+        self.epa = epa = FakeEpa(range(0, 32), TWO_NODES)
+        with patch.object(resource_manager, 'collect_osd_facts',
+                          return_value=osds), \
+                patch.object(resource_manager, 'collect_host_facts',
+                             return_value=host):
+            return resource_manager.reconcile(client_factory=lambda: epa)
+
+    def applied_addresses(self):
+        return dict(
+            (allocation['osd-id'],
+             (allocation['public-addr'], allocation['cluster-addr']))
+            for _, allocations in self.applied for allocation in allocations)
+
+    def bound_before_connect(self):
+        """OSDs whose rendered drop-in binds outgoing connections."""
+        apply = resource_manager.resource_apply
+        return sorted(
+            allocation['osd-id']
+            for profile, allocations in self.applied
+            for allocation in allocations
+            if 'ms_bind_before_connect' in apply.render_dropin(
+                profile, allocation['cores'],
+                addresses=apply.allocation_addresses(allocation)))
+
+    def logged(self, level):
+        return [call[0][0] for call in self.log.call_args_list
+                if call[1].get('level') == level]
+
+    def test_performance_binds_the_far_socket_nics(self):
+        state = self.reconcile_with(
+            rp.PROFILE_PERFORMANCE, [osd(0, node=0), osd(1, node=1)],
+            per_socket_networks())
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(state['warnings'], [])
+        self.assertEqual(self.applied_addresses(), {
+            '0': (None, None),
+            '1': ('10.0.1.5', '10.1.1.5'),
+        })
+        # Only the OSD with a per-node address needs bind-before-connect.
+        self.assertEqual(self.bound_before_connect(), ['1'])
+        self.assertEqual(state['osds']['1']['public-addr'], '10.0.1.5')
+        self.assertEqual(state['osds']['1']['cluster-addr'], '10.1.1.5')
+        info = self.logged(resource_manager.INFO)
+        self.assertIn(
+            'osd.1: binding public address 10.0.1.5 on ens2f0, local to '
+            'NUMA node 1 (from ceph-public-network)', info)
+        self.assertIn(
+            'osd.0: host public address 10.0.0.5 on ens1f0 is local to '
+            'NUMA node 0', info)
+
+    def test_performance_reports_a_remote_public_network(self):
+        state = self.reconcile_with(
+            rp.PROFILE_PERFORMANCE, [osd(1, node=1)],
+            per_socket_networks(public_nodes=(0,)))
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(self.applied_addresses(),
+                         {'1': (None, '10.1.1.5')})
+        self.assertEqual(len(state['warnings']), 1)
+        self.assertIn('osd.1: no public network address on NUMA node 1',
+                      state['warnings'][0])
+        status = resource_manager.assess()
+        self.assertFalse(status.blocked)
+        self.assertIn('1 deviation', status.message)
+
+    def test_balanced_only_logs_a_remote_network(self):
+        state = self.reconcile_with(
+            rp.PROFILE_BALANCED, [osd(1, node=1)],
+            per_socket_networks(public_nodes=(0,), cluster_nodes=(0,)))
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(state['warnings'], [])
+        self.assertEqual(self.applied_addresses(), {'1': (None, None)})
+        self.assertEqual(self.bound_before_connect(), [])
+        warnings = self.logged(resource_manager.WARNING)
+        self.assertTrue(any(
+            m.startswith('osd.1: no public network address on NUMA node 1')
+            for m in warnings), warnings)
+        self.assertTrue(any(
+            m.startswith('osd.1: no cluster network address on NUMA node 1')
+            for m in warnings), warnings)
+        self.assertEqual(resource_manager.assess().message,
+                         'profile balanced applied')
+
+    def test_balanced_degraded_to_any_node_keeps_host_addresses(self):
+        self.config['performance-profile'] = rp.PROFILE_BALANCED
+        # Only node 0 has free CPUs, so osd.1 is allocated without NUMA
+        # locality and must not bind the node 1 NICs.
+        self.epa = epa = FakeEpa(range(0, 16), TWO_NODES)
+        with patch.object(resource_manager, 'collect_osd_facts',
+                          return_value=[osd(1, node=1)]), \
+                patch.object(resource_manager, 'collect_host_facts',
+                             return_value=per_socket_networks()):
+            resource_manager.reconcile(client_factory=lambda: epa)
+        self.assertEqual(self.applied[-1][1][0]['mode'], rp.MODE_ANY)
+        self.assertEqual(self.applied_addresses(), {'1': (None, None)})
+        self.assertIn(
+            'osd.1: not pinned to a NUMA node; keeping the host public '
+            'address 10.0.0.5', self.logged(resource_manager.INFO))
+
+    def host_with_cluster_nic_set_down(self):
+        """Discovered facts with the node 1 cluster NIC set down."""
+        self.config['ceph-cluster-network'] = '10.1.0.0/23'
+        return collect(CollectorTestCase.UP_ADDRESSES,
+                       CollectorTestCase.INTERFACE_NODES,
+                       CollectorTestCase.HOST_ADDRESSES,
+                       down=CollectorTestCase.DOWN_ADDRESSES)
+
+    def test_balanced_keeps_the_host_address_over_a_nic_set_down(self):
+        state = self.reconcile_with(
+            rp.PROFILE_BALANCED, [osd(1, node=1)],
+            self.host_with_cluster_nic_set_down())
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(self.applied_addresses(), {'1': (None, None)})
+        self.assertEqual(self.bound_before_connect(), [])
+        self.assertTrue(any(
+            m.startswith('osd.1: no cluster network address on NUMA node 1 '
+                         '(candidates: 10.1.0.5 on ens1f1 (NUMA node 0))')
+            for m in self.logged(resource_manager.WARNING)))
+
+    def test_performance_does_not_align_with_a_nic_set_down(self):
+        state = self.reconcile_with(
+            rp.PROFILE_PERFORMANCE, [osd(1, node=1)],
+            self.host_with_cluster_nic_set_down())
+        self.assertIn('Ceph cluster network interfaces (ens1f1) are on '
+                      'node(s) 0', ' '.join(state['errors']))
+        self.assertEqual(self.applied_addresses(), {})
+
+    def host_with_bonded_cluster_network(self):
+        """Discovered facts with the cluster network on spanning bonds."""
+        self.config['ceph-public-network'] = '10.0.0.0/23'
+        self.config['ceph-cluster-network'] = '10.1.0.0/23'
+        return collect(CollectorTestCase.BONDED_ADDRESSES,
+                       CollectorTestCase.BONDED_NODES,
+                       CollectorTestCase.HOST_ADDRESSES,
+                       bonds=CollectorTestCase.BONDS)
+
+    def test_balanced_warns_about_a_bond_without_a_primary(self):
+        state = self.reconcile_with(
+            rp.PROFILE_BALANCED, [osd(1, node=1)],
+            self.host_with_bonded_cluster_network())
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(state['warnings'], [])
+        self.assertEqual(self.applied_addresses(), {'1': ('10.0.1.5', None)})
+        self.assertIn(
+            'osd.1: keeping host cluster address 10.1.0.5 on bond0.20, which '
+            'spans NUMA nodes 0,1 and is not reliably local to node 1; bond0 '
+            'is an active-backup bond without a primary leg, so its traffic '
+            'uses whichever leg is active; set a primary leg to make it '
+            "local to that leg's node", self.logged(resource_manager.WARNING))
+        self.assertEqual(resource_manager.assess().message,
+                         'profile balanced applied')
+
+    def test_performance_reports_a_bond_without_a_primary(self):
+        state = self.reconcile_with(
+            rp.PROFILE_PERFORMANCE, [osd(0, node=0), osd(1, node=1)],
+            self.host_with_bonded_cluster_network())
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(self.applied_addresses(), {
+            '0': (None, None), '1': ('10.0.1.5', None)})
+        self.assertEqual(len(state['warnings']), 2)
+        self.assertTrue(all(
+            'bond0.20, which spans NUMA nodes 0,1' in warning
+            for warning in state['warnings']), state['warnings'])
+        status = resource_manager.assess()
+        self.assertFalse(status.blocked)
+        self.assertIn('2 deviation', status.message)
+
+    def test_minimal_keeps_host_addresses(self):
+        state = self.reconcile_with(
+            rp.PROFILE_MINIMAL, [osd(1, node=1)], per_socket_networks())
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(self.applied_addresses(), {'1': (None, None)})
+        self.assertEqual(self.bound_before_connect(), [])
+
+    def test_host_without_network_facts_keeps_host_addresses(self):
+        host = rp.HostFacts(nodes=TWO_NODES, nic_interface='eth0',
+                            nic_nodes=set([0, 1]))
+        self.reconcile_with(rp.PROFILE_PERFORMANCE, [osd(1, node=1)], host)
+        self.assertEqual(self.applied_addresses(), {'1': (None, None)})
+
+    def test_verify_checks_recorded_addresses(self):
+        record = {'osd-id': '1', 'cores': '16-27', 'mode': rp.MODE_NUMA,
+                  'numa-node': 1, 'numa-policy': 'bind',
+                  'public-addr': '10.0.1.5', 'cluster-addr': None}
+        self.kv.set(resource_manager.STATE_KEY, {
+            'version': 1, 'profile': rp.PROFILE_PERFORMANCE,
+            'osds': {'1': record}})
+        epa = FakeEpa(range(0, 32), TWO_NODES,
+                      foreign={'ceph-osd.1': list(range(16, 28))})
+        expected = resource_manager.resource_apply.render_dropin(
+            rp.PROFILE_PERFORMANCE, '16-27', numa_policy='bind',
+            numa_node=1, addresses={'public-addr': '10.0.1.5'})
+        with patch.object(resource_manager.resource_apply, 'read_dropin',
+                          return_value=expected):
+            self.assertEqual(
+                resource_manager.verify(client_factory=lambda: epa), [])
+        self.verify_running.assert_called_once_with(
+            '1', '16-27', addresses={'public-addr': '10.0.1.5'})
+
+        unbound = resource_manager.resource_apply.render_dropin(
+            rp.PROFILE_PERFORMANCE, '16-27', numa_policy='bind',
+            numa_node=1)
+        with patch.object(resource_manager.resource_apply, 'read_dropin',
+                          return_value=unbound):
+            drift = resource_manager.verify(client_factory=lambda: epa)
+        self.assertEqual(len(drift), 1)
+        self.assertIn('drop-in differs', drift[0])
+
+    def test_status_report_separates_a_fallback_from_the_plan(self):
+        # Only node 0 has free CPUs, so balanced allocates osd.1 on any
+        # node, with the host addresses, while the plan keeps node 1.
+        self.config['performance-profile'] = rp.PROFILE_BALANCED
+        epa = FakeEpa(range(0, 16), TWO_NODES)
+        with patch.object(resource_manager, 'collect_osd_facts',
+                          return_value=[osd(1, node=1)]), \
+                patch.object(resource_manager, 'collect_host_facts',
+                             return_value=per_socket_networks()):
+            resource_manager.reconcile(client_factory=lambda: epa)
+            report = resource_manager.status_report(
+                client_factory=lambda: epa)
+        entry, = report['osds']
+        self.assertEqual(entry['desired-mode'], rp.MODE_NUMA)
+        self.assertEqual(entry['desired-numa-node'], 1)
+        self.assertEqual(entry['desired-public-addr'], '10.0.1.5')
+        self.assertIn('binding public address 10.0.1.5',
+                      entry['desired-address-binding'][0])
+        self.assertEqual(entry['applied-mode'], rp.MODE_ANY)
+        self.assertIsNone(entry['applied-numa-node'])
+        self.assertIsNone(entry['applied-public-addr'])
+        self.assertIsNone(entry['applied-cluster-addr'])
+        self.assertEqual(entry['applied-address-binding'], [
+            'not pinned to a NUMA node; keeping the host public address '
+            '10.0.0.5',
+            'not pinned to a NUMA node; keeping the host cluster address '
+            '10.1.0.5'])
+
+    def test_status_report_shows_networks_and_bindings(self):
+        self.kv.set(resource_manager.STATE_KEY, {
+            'profile': rp.PROFILE_PERFORMANCE,
+            'osds': {'1': {'osd-id': '1', 'cores': '16-27',
+                           'public-addr': '10.0.1.5',
+                           'cluster-addr': '10.1.1.5'}},
+        })
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        with patch.object(resource_manager, 'collect_osd_facts',
+                          return_value=[osd(0, node=0), osd(1, node=1)]), \
+                patch.object(resource_manager, 'collect_host_facts',
+                             return_value=per_socket_networks(
+                                 public_nodes=(0,))):
+            report = resource_manager.status_report(
+                dry_run=rp.PROFILE_PERFORMANCE, client_factory=lambda: epa)
+        self.assertEqual(report['networks']['public'], {
+            'source': 'ceph-public-network',
+            'host-address': '10.0.0.5',
+            'candidates': [{'address': '10.0.0.5', 'interface': 'ens1f0',
+                            'numa-nodes': [0]}],
+        })
+        cluster = report['networks']['cluster']
+        self.assertEqual([c['address'] for c in cluster['candidates']],
+                         ['10.1.0.5', '10.1.1.5'])
+        first, second = report['osds']
+        self.assertIsNone(first['desired-public-addr'])
+        self.assertIsNone(first['desired-cluster-addr'])
+        self.assertIsNone(first['applied-public-addr'])
+        self.assertIsNone(second['desired-public-addr'])
+        self.assertEqual(second['desired-cluster-addr'], '10.1.1.5')
+        self.assertEqual(second['applied-public-addr'], '10.0.1.5')
+        self.assertEqual(second['applied-cluster-addr'], '10.1.1.5')
+        self.assertEqual(len(second['desired-address-binding']), 2)
+        self.assertIn('no public network address on NUMA node 1',
+                      second['desired-address-binding'][0])
+        self.assertEqual(len(report['warnings']), 1)

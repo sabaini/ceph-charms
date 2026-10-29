@@ -39,6 +39,42 @@ def host(nodes=None, nic_nodes=(0,), interface='eth0'):
                         nic_nodes=set(nic_nodes))
 
 
+def candidate(address, interface, *nodes, note=None):
+    return rp.NetworkCandidate(address=address, interface=interface,
+                               nodes=tuple(nodes), note=note)
+
+
+NO_PRIMARY = 'bond0 is an active-backup bond without a primary leg'
+
+
+def network(role, host_address, *candidates, source='ceph-public-network'):
+    return rp.NetworkFacts(role=role, source=source,
+                           host_address=host_address,
+                           candidates=tuple(candidates))
+
+
+# One NIC per socket on each network; the host addresses are on node 0.
+PUBLIC = network(rp.NETWORK_PUBLIC, '10.0.0.5',
+                 candidate('10.0.0.5', 'ens1f0', 0),
+                 candidate('10.0.1.5', 'ens2f0', 1))
+CLUSTER = network(rp.NETWORK_CLUSTER, '10.1.0.5',
+                  candidate('10.1.0.5', 'ens1f1', 0),
+                  candidate('10.1.1.5', 'ens2f1', 1),
+                  source='ceph-cluster-network')
+
+
+def networked_host(public=PUBLIC, cluster=CLUSTER, nodes=None):
+    """Build host facts whose NIC fields derive from the cluster network."""
+    if nodes is None:
+        nodes = {0: list(range(0, 8)), 1: list(range(8, 16))}
+    return rp.HostFacts(
+        nodes=nodes,
+        nic_interface=','.join(sorted(
+            set(c.interface for c in cluster.candidates))),
+        nic_nodes=set(n for c in cluster.candidates for n in c.nodes),
+        networks={rp.NETWORK_PUBLIC: public, rp.NETWORK_CLUSTER: cluster})
+
+
 SINGLE_NODE = {0: list(range(0, 16))}
 
 
@@ -269,3 +305,207 @@ class SerialisationTestCase(unittest.TestCase):
     def test_request_repr(self):
         plan = rp.build_plan(rp.PROFILE_MINIMAL, [osd(2)], host())
         self.assertIn("osd_id='2'", repr(plan.requests[0]))
+
+
+class AddressChoiceTestCase(unittest.TestCase):
+
+    def test_binds_the_address_on_the_osd_node(self):
+        choice = rp.choose_address(PUBLIC, 1)
+        self.assertEqual(choice.outcome, rp.BIND_LOCAL)
+        self.assertEqual(choice.address, '10.0.1.5')
+        self.assertIn('ens2f0', choice.message)
+        self.assertIn('ceph-public-network', choice.message)
+
+    def test_keeps_a_local_host_address(self):
+        choice = rp.choose_address(PUBLIC, 0)
+        self.assertEqual(choice.outcome, rp.BIND_HOST)
+        self.assertIsNone(choice.address)
+        self.assertIn('10.0.0.5', choice.message)
+
+    def test_falls_back_without_an_address_on_the_node(self):
+        single_nic = network(rp.NETWORK_PUBLIC, '10.0.0.5',
+                             candidate('10.0.0.5', 'ens1f0', 0))
+        choice = rp.choose_address(single_nic, 1)
+        self.assertEqual(choice.outcome, rp.BIND_REMOTE)
+        self.assertIsNone(choice.address)
+        self.assertIn('NUMA node 1', choice.message)
+        self.assertIn('10.0.0.5 on ens1f0 (NUMA node 0)', choice.message)
+        self.assertIn('keeping the host public address 10.0.0.5',
+                      choice.message)
+
+    def test_unknown_locality_keeps_the_host_address(self):
+        virtual = network(rp.NETWORK_PUBLIC, '10.0.0.5',
+                          candidate('10.0.0.5', 'eth0'),
+                          candidate('10.0.1.5', 'eth1'))
+        choice = rp.choose_address(virtual, 1)
+        self.assertEqual(choice.outcome, rp.BIND_UNKNOWN)
+        self.assertIsNone(choice.address)
+        self.assertIn('unknown', choice.message)
+
+    def test_no_candidates_is_unknown(self):
+        choice = rp.choose_address(
+            network(rp.NETWORK_PUBLIC, '10.0.0.5'), 1)
+        self.assertEqual(choice.outcome, rp.BIND_UNKNOWN)
+        self.assertIn('candidates: none', choice.message)
+
+    def test_unpinned_osd_keeps_the_host_address(self):
+        choice = rp.choose_address(PUBLIC, None)
+        self.assertEqual(choice.outcome, rp.BIND_UNPINNED)
+        self.assertIsNone(choice.address)
+
+    def test_single_node_host_keeps_the_host_address(self):
+        choice = rp.choose_address(PUBLIC, 1, single_node=True)
+        self.assertEqual(choice.outcome, rp.BIND_HOST)
+        self.assertIsNone(choice.address)
+
+    def test_without_a_host_address_ceph_selection_is_overridden(self):
+        # prefer-ipv6 with a configured network leaves the choice to Ceph,
+        # which may pick an address on the other node.
+        ipv6 = network(rp.NETWORK_PUBLIC, None,
+                       candidate('fd00::5', 'ens1f0', 0))
+        choice = rp.choose_address(ipv6, 0)
+        self.assertEqual(choice.outcome, rp.BIND_LOCAL)
+        self.assertEqual(choice.address, 'fd00::5')
+
+    def test_node_exclusive_interface_beats_a_spanning_host_bond(self):
+        bonded = network(rp.NETWORK_PUBLIC, '10.0.0.5',
+                         candidate('10.0.0.5', 'bond0', 0, 1),
+                         candidate('10.0.9.5', 'ens2f0', 1))
+        choice = rp.choose_address(bonded, 1)
+        self.assertEqual(choice.address, '10.0.9.5')
+        self.assertFalse(choice.spanning)
+        # The spanning bond is still local to node 0.
+        self.assertEqual(rp.choose_address(bonded, 0).outcome, rp.BIND_HOST)
+
+    def test_spanning_host_bond_is_kept_but_marked(self):
+        bonded = network(rp.NETWORK_PUBLIC, '10.0.0.5',
+                         candidate('10.0.0.5', 'bond0.20', 0, 1,
+                                   note=NO_PRIMARY))
+        choice = rp.choose_address(bonded, 1)
+        self.assertEqual(choice.outcome, rp.BIND_HOST)
+        self.assertIsNone(choice.address)
+        self.assertTrue(choice.spanning)
+        self.assertEqual(
+            choice.message,
+            'keeping host public address 10.0.0.5 on bond0.20, which spans '
+            'NUMA nodes 0,1 and is not reliably local to node 1; ' +
+            NO_PRIMARY)
+
+    def test_spanning_bond_is_bound_when_nothing_else_is_local(self):
+        bonded = network(rp.NETWORK_PUBLIC, '10.0.0.5',
+                         candidate('10.0.0.5', 'ens1f0', 0),
+                         candidate('10.0.9.5', 'bond1', 0, 1))
+        choice = rp.choose_address(bonded, 1)
+        self.assertEqual(choice.outcome, rp.BIND_LOCAL)
+        self.assertEqual(choice.address, '10.0.9.5')
+        self.assertTrue(choice.spanning)
+        self.assertEqual(
+            choice.message,
+            'binding public address 10.0.9.5 (from ceph-public-network) on '
+            'bond1, which spans NUMA nodes 0,1 and is not reliably local to '
+            'node 1')
+
+    def test_host_address_beats_a_lower_local_address(self):
+        two = network(rp.NETWORK_PUBLIC, '10.0.0.9',
+                      candidate('10.0.0.1', 'ens1f0', 0),
+                      candidate('10.0.0.9', 'ens1f1', 0))
+        self.assertEqual(rp.choose_address(two, 0).outcome, rp.BIND_HOST)
+
+    def test_lowest_address_breaks_remaining_ties(self):
+        two = network(rp.NETWORK_PUBLIC, '10.0.0.5',
+                      candidate('10.0.1.10', 'ens2f1', 1),
+                      candidate('10.0.1.9', 'ens2f0', 1))
+        self.assertEqual(rp.choose_address(two, 1).address, '10.0.1.9')
+
+    def test_choose_addresses_covers_every_network(self):
+        choices = rp.choose_addresses(networked_host(), 1)
+        self.assertEqual([(c.role, c.address) for c in choices],
+                         [(rp.NETWORK_PUBLIC, '10.0.1.5'),
+                          (rp.NETWORK_CLUSTER, '10.1.1.5')])
+
+    def test_choose_addresses_without_networks(self):
+        self.assertEqual(rp.choose_addresses(host(), 1), [])
+
+
+class NetworkPlanTestCase(unittest.TestCase):
+
+    def test_strict_profile_accepts_a_cluster_nic_per_socket(self):
+        osds = [osd(0, data_node=0), osd(1, data_node=1)]
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, osds, networked_host())
+        self.assertTrue(plan.satisfiable)
+        self.assertEqual(plan.deviations(), [])
+
+    def test_strict_profile_refuses_a_remote_cluster_network(self):
+        cluster = network(rp.NETWORK_CLUSTER, '10.1.0.5',
+                          candidate('10.1.0.5', 'ens1f1', 0))
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(1, data_node=1)],
+                             networked_host(cluster=cluster))
+        self.assertFalse(plan.satisfiable)
+        self.assertIn('ens1f1', plan.errors[0])
+
+    def test_strict_profile_warns_about_a_remote_public_network(self):
+        public = network(rp.NETWORK_PUBLIC, '10.0.0.5',
+                         candidate('10.0.0.5', 'bond0', 0))
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(1, data_node=1)],
+                             networked_host(public=public))
+        self.assertTrue(plan.satisfiable)
+        self.assertEqual(len(plan.deviations()), 1)
+        self.assertIn('osd.1: no public network address on NUMA node 1',
+                      plan.deviations()[0])
+
+    def test_strict_profile_does_not_repeat_a_shared_network_warning(self):
+        # Without a separate cluster network both roles share candidates;
+        # the cluster check already speaks for the public network.
+        shared = network(rp.NETWORK_CLUSTER, '10.0.0.5',
+                         *PUBLIC.candidates)
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(1, data_node=1)],
+                             networked_host(cluster=shared))
+        self.assertTrue(plan.satisfiable)
+        self.assertEqual(plan.deviations(), [])
+
+    def test_strict_profile_reports_a_spanning_cluster_bond(self):
+        bond = candidate('10.1.0.5', 'bond0', 0, 1, note=NO_PRIMARY)
+        cluster = network(rp.NETWORK_CLUSTER, '10.1.0.5', bond)
+        public = network(rp.NETWORK_PUBLIC, '10.1.0.5', bond)
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(1, data_node=1)],
+                             networked_host(public=public, cluster=cluster))
+        self.assertTrue(plan.satisfiable)
+        # One deviation: the shared public network is not reported again.
+        self.assertEqual(plan.deviations(), [
+            'osd.1: keeping host cluster address 10.1.0.5 on bond0, which '
+            'spans NUMA nodes 0,1 and is not reliably local to node 1; ' +
+            NO_PRIMARY])
+
+    def test_strict_profile_prefers_a_wholly_local_cluster_nic(self):
+        cluster = network(rp.NETWORK_CLUSTER, '10.1.0.5',
+                          candidate('10.1.0.5', 'bond0', 0, 1),
+                          candidate('10.1.1.5', 'ens2f1', 1))
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(1, data_node=1)],
+                             networked_host(cluster=cluster))
+        self.assertTrue(plan.satisfiable)
+        self.assertEqual(plan.deviations(), [])
+
+    def test_strict_profile_reports_a_spanning_public_bond(self):
+        public = network(rp.NETWORK_PUBLIC, '10.0.0.5',
+                         candidate('10.0.0.5', 'bond0', 0, 1,
+                                   note=NO_PRIMARY))
+        plan = rp.build_plan(rp.PROFILE_PERFORMANCE, [osd(1, data_node=1)],
+                             networked_host(public=public))
+        self.assertTrue(plan.satisfiable)
+        self.assertEqual(len(plan.deviations()), 1)
+        self.assertIn('keeping host public address 10.0.0.5 on bond0',
+                      plan.deviations()[0])
+
+    def test_balanced_profile_does_not_report_a_spanning_bond(self):
+        bond = candidate('10.1.0.5', 'bond0', 0, 1, note=NO_PRIMARY)
+        plan = rp.build_plan(
+            rp.PROFILE_BALANCED, [osd(1, data_node=1)], networked_host(
+                cluster=network(rp.NETWORK_CLUSTER, '10.1.0.5', bond)))
+        self.assertEqual(plan.deviations(), [])
+
+    def test_balanced_profile_does_not_warn_about_networks(self):
+        public = network(rp.NETWORK_PUBLIC, '10.0.0.5',
+                         candidate('10.0.0.5', 'bond0', 0))
+        plan = rp.build_plan(rp.PROFILE_BALANCED, [osd(1, data_node=1)],
+                             networked_host(public=public))
+        self.assertEqual(plan.deviations(), [])

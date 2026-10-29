@@ -68,6 +68,43 @@ class DropinTestCase(unittest.TestCase):
         app_name.assert_called_once_with()
         self.assertNotIn('NUMAMask', content)
 
+    def test_render_dropin_passes_address_overrides_to_ceph(self):
+        content = resource_apply.render_dropin(
+            'performance', [4, 5], numa_policy='bind', numa_node=1,
+            addresses={'public-addr': '10.0.1.5',
+                       'cluster-addr': '10.1.1.5'})
+        self.assertIn(
+            'Environment="CEPH_ARGS=--public_addr=10.0.1.5 '
+            '--cluster_addr=10.1.1.5 --ms_bind_before_connect=true"\n',
+            content)
+
+    def test_render_dropin_passes_only_the_overridden_address(self):
+        content = resource_apply.render_dropin(
+            'performance', [4, 5],
+            addresses={'public-addr': None, 'cluster-addr': 'fd00:1::5'})
+        self.assertIn(
+            'Environment="CEPH_ARGS=--cluster_addr=fd00:1::5 '
+            '--ms_bind_before_connect=true"\n', content)
+
+    def test_render_dropin_without_overrides_is_unchanged(self):
+        # Hosts without per-node addresses must not see new drop-in bytes,
+        # which would restart every OSD on charm upgrade.
+        self.assertEqual(
+            resource_apply.render_dropin(
+                'performance', [4, 5], numa_policy='bind', numa_node=1,
+                addresses={'public-addr': None, 'cluster-addr': None}),
+            resource_apply.render_dropin(
+                'performance', [4, 5], numa_policy='bind', numa_node=1))
+        self.assertNotIn('CEPH_ARGS', resource_apply.render_dropin(
+            'performance', [4, 5]))
+
+    def test_allocation_addresses_omits_host_addresses(self):
+        self.assertEqual(
+            resource_apply.allocation_addresses(
+                {'public-addr': '10.0.1.5', 'cluster-addr': None}),
+            {'public-addr': '10.0.1.5'})
+        self.assertEqual(resource_apply.allocation_addresses({}), {})
+
     def test_render_dropin_accepts_a_range_string(self):
         # State records CPU sets as range strings.
         content = resource_apply.render_dropin('balanced', '4-7')
@@ -125,6 +162,111 @@ class EnforcementVerificationTestCase(unittest.TestCase):
             resource_apply.ApplyError,
             resource_apply.verify_enforcement, '0', [4, 5, 6, 7])
         affinities.assert_called_once_with(123)
+
+
+class AddressVerificationTestCase(unittest.TestCase):
+
+    def test_parse_entity_address(self):
+        parse = resource_apply._parse_entity_address
+        self.assertEqual(str(parse('v2:10.0.1.5:0/0')), '10.0.1.5')
+        self.assertEqual(str(parse('10.0.1.5:0/0')), '10.0.1.5')
+        self.assertEqual(str(parse('any:10.0.1.5:6800/12')), '10.0.1.5')
+        self.assertEqual(str(parse('v2:[FD00:1::5]:0/0')), 'fd00:1::5')
+        self.assertIsNone(parse('-'))
+        self.assertIsNone(parse('none'))
+        self.assertIsNone(parse(None))
+
+    @patch.object(resource_apply, '_daemon_config_value')
+    def test_verify_addresses_accepts_matching_values(self, config_value):
+        config_value.side_effect = lambda osd_id, option: {
+            'public_addr': 'v2:10.0.1.5:0/0',
+            'cluster_addr': 'v2:[fd00:1::5]:0/0',
+            'ms_bind_before_connect': 'true'}[option]
+        resource_apply.verify_addresses(
+            '0', {'public-addr': '10.0.1.5', 'cluster-addr': 'fd00:1:0::5'})
+
+    @patch.object(resource_apply, '_daemon_config_value')
+    def test_verify_addresses_requires_bind_before_connect(
+            self, config_value):
+        config_value.side_effect = lambda osd_id, option: {
+            'cluster_addr': 'v2:10.1.1.5:0/0',
+            'ms_bind_before_connect': 'false'}[option]
+        with self.assertRaises(resource_apply.ApplyError) as raised:
+            resource_apply.verify_addresses('2', {'cluster-addr': '10.1.1.5'})
+        self.assertIn('ms_bind_before_connect', str(raised.exception))
+
+    @patch.object(resource_apply, '_daemon_config_value')
+    def test_verify_addresses_rejects_an_ignored_override(self, config_value):
+        config_value.return_value = 'v2:10.0.0.5:0/0'
+        with self.assertRaises(resource_apply.ApplyError) as raised:
+            resource_apply.verify_addresses('3', {'public-addr': '10.0.1.5'})
+        self.assertIn('osd.3', str(raised.exception))
+        self.assertIn('public_addr', str(raised.exception))
+        config_value.assert_called_once_with('3', 'public_addr')
+
+    @patch.object(resource_apply, '_daemon_config_value')
+    def test_verify_addresses_skips_host_addresses(self, config_value):
+        resource_apply.verify_addresses('0', {})
+        config_value.assert_not_called()
+
+    @patch.object(resource_apply, '_thread_cpu_affinities',
+                  return_value={'10': '4-5'})
+    @patch.object(resource_apply, '_unit_main_pid', return_value=123)
+    @patch.object(resource_apply, '_daemon_config_value')
+    def test_verify_enforcement_checks_addresses(
+            self, config_value, main_pid, affinities):
+        config_value.side_effect = ['false', '-1', 'v2:10.0.0.5:0/0']
+        self.assertRaises(
+            resource_apply.ApplyError,
+            resource_apply.verify_enforcement, '0', [4, 5],
+            addresses={'public-addr': '10.0.1.5'})
+
+
+class RunningVerificationTestCase(unittest.TestCase):
+
+    def setUp(self):
+        super(RunningVerificationTestCase, self).setUp()
+        for name in ('verify_enforcement', '_unit_main_pid', '_osd_state'):
+            patcher = patch.object(resource_apply, name)
+            setattr(self, name.lstrip('_'), patcher.start())
+            self.addCleanup(patcher.stop)
+        self.unit_main_pid.return_value = 123
+        self.osd_state.return_value = 'active'
+
+    def test_running_osd_is_verified(self):
+        self.assertTrue(resource_apply.verify_running(
+            '0', [4, 5], addresses={'public-addr': '10.0.1.5'}))
+        self.verify_enforcement.assert_called_once_with(
+            '0', [4, 5], addresses={'public-addr': '10.0.1.5'})
+
+    def test_running_mismatch_is_raised(self):
+        self.verify_enforcement.side_effect = resource_apply.ApplyError(
+            'osd.0 thread affinity escapes 4-5')
+        self.assertRaises(resource_apply.ApplyError,
+                          resource_apply.verify_running, '0', [4, 5])
+
+    def test_stopped_osd_is_skipped(self):
+        self.unit_main_pid.return_value = None
+        self.assertFalse(resource_apply.verify_running('0', [4, 5]))
+        self.verify_enforcement.assert_not_called()
+
+    def test_unanswered_admin_socket_is_skipped(self):
+        self.osd_state.return_value = None
+        self.assertFalse(resource_apply.verify_running('0', [4, 5]))
+        self.verify_enforcement.assert_not_called()
+
+    def test_restart_during_the_check_is_skipped(self):
+        self.verify_enforcement.side_effect = resource_apply.ApplyError(
+            "osd.0 has conflicting Ceph NUMA affinity settings "
+            "(osd_numa_auto_affinity=None, osd_numa_node=None)")
+        self.unit_main_pid.side_effect = [123, 456]
+        self.assertFalse(resource_apply.verify_running('0', [4, 5]))
+
+    def test_stop_during_the_check_is_skipped(self):
+        self.verify_enforcement.side_effect = resource_apply.ApplyError(
+            'cannot read effective CPU affinity for osd.0')
+        self.osd_state.side_effect = ['active', None]
+        self.assertFalse(resource_apply.verify_running('0', [4, 5]))
 
 
 class ReadinessTestCase(unittest.TestCase):
@@ -268,9 +410,30 @@ class ApplyTestCase(unittest.TestCase):
         self.assertIn('NUMAMask=0',
                       resource_apply.read_dropin('0'))
         self.verify_enforcement.assert_has_calls([
-            unittest.mock.call('0', [4, 5]),
-            unittest.mock.call('1', [6, 7]),
+            unittest.mock.call('0', [4, 5], addresses={}),
+            unittest.mock.call('1', [6, 7], addresses={}),
         ])
+
+    def test_apply_binds_and_verifies_address_overrides(self):
+        allocation = self.allocation('0', [4, 5], node=1, policy='bind')
+        allocation['public-addr'] = '10.0.1.5'
+        allocation['cluster-addr'] = None
+        resource_apply.apply_allocations('performance', [allocation])
+        self.assertIn(
+            'CEPH_ARGS=--public_addr=10.0.1.5 --ms_bind_before_connect=true"',
+            resource_apply.read_dropin('0'))
+        self.verify_enforcement.assert_called_once_with(
+            '0', [4, 5], addresses={'public-addr': '10.0.1.5'})
+
+    def test_apply_restarts_when_only_the_address_changes(self):
+        allocation = self.allocation('0', [4, 5], node=1, policy='bind')
+        resource_apply.apply_allocations('performance', [allocation])
+        self.calls = []
+        allocation['public-addr'] = '10.0.1.5'
+        self.assertEqual(
+            resource_apply.apply_allocations('performance', [allocation]),
+            ['0'])
+        self.assertEqual(self.calls, ['daemon-reload', 'ceph-osd@0'])
 
     def test_apply_is_idempotent(self):
         allocations = [self.allocation('0', [4, 5])]
@@ -279,6 +442,18 @@ class ApplyTestCase(unittest.TestCase):
         self.assertEqual(
             resource_apply.apply_allocations('minimal', allocations), [])
         self.assertEqual(self.calls, [])
+
+    def test_apply_verifies_unchanged_osds_only_while_running(self):
+        allocations = [self.allocation('0', [4, 5]),
+                       self.allocation('1', [6, 7])]
+        resource_apply.apply_allocations('minimal', allocations)
+        self.verify_enforcement.reset_mock()
+        with patch.object(resource_apply, '_running_pid',
+                          side_effect=lambda osd_id: {'1': 456}.get(osd_id)):
+            self.assertEqual(resource_apply.apply_allocations(
+                'minimal', allocations, verify_unchanged=True), [])
+        self.verify_enforcement.assert_called_once_with(
+            '1', [6, 7], addresses={})
 
     def test_apply_only_restarts_changed_osds(self):
         resource_apply.apply_allocations('minimal', [
