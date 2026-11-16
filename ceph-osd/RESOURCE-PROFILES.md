@@ -49,10 +49,11 @@ resource or tier, or a count that is not a positive integer, blocks the unit
 without allocating anything. Like the profile itself, the override applies to
 the whole application.
 
-The charm never offers more than 75% of a NUMA node's logical CPUs to the EPA
-orchestrator (see [CPU pool](#cpu-pool)), so a count above that is logged as a
-warning naming the affected nodes. The count is not refused because of the
-warning alone, since an externally managed pool is not capped by the charm. If
+Unless `epa-cpu-pool` is set, the charm never offers more than 75% of a NUMA
+node's logical CPUs to the EPA orchestrator (see [CPU pool](#cpu-pool)), so a
+count above that is logged as a warning naming the affected nodes. The count
+is not refused because of the warning alone, since an externally managed pool
+is not capped by the charm. If
 the allocator cannot grant the CPUs, `performance` blocks the unit on the
 capacity check.
 
@@ -346,7 +347,8 @@ and release. An externally managed snap must already have a general pool
 configured and its daemon restarted. The charm checks capabilities through
 the default isolated listing before attempting any general-pool operation.
 
-When the charm owns the installation it configures the general pool:
+When the charm owns the installation it configures the general pool. Unless
+`epa-cpu-pool` is set, it calculates the pool:
 
 * every NUMA node contributes CPUs, so NUMA-aligned requests can be
   served wherever an OSD's device lives;
@@ -359,10 +361,60 @@ When the charm owns the installation it configures the general pool:
   migration, and EPA rejects pool changes that exclude CPUs it already
   granted.
 
+#### Choosing the pool yourself
+
+Set `epa-cpu-pool` to a CPU list to replace that calculation:
+
+```
+juju config ceph-osd epa-cpu-pool=8-31,40-63
+```
+
+The general pool is then exactly that list on every unit of the
+application. There is no floor, cap or CPU 0 exclusion, and the list may
+also remove CPUs from the pool. It has to cover the profile's demand on each
+NUMA node that hosts OSD devices: a pool that is too small is treated like
+any other shortage, so `performance` blocks the unit while `balanced` and
+`minimal` degrade with a warning.
+
+The charm never adjusts the list. A unit blocks, and keeps its current
+pool, when:
+
+* the value is not a CPU list of IDs and ranges, as the snap accepts it.
+  Empty components such as `8,,9` are refused rather than repaired;
+* it names CPUs that are not online on that host. The option is
+  application-wide, so hosts with different CPU layouts need a list that is
+  valid on all of them, or separate applications;
+* it names isolated CPUs, which EPA keeps in its separate `isolated` pool;
+* a change would remove CPUs that are still claimed in EPA, by an OSD or
+  by any other workload.
+
+These checks apply when the pool is changed. Once a pool is applied, a CPU
+in it that goes offline does not block the unit: EPA stops granting that CPU,
+and the charm reports it as a profile warning. Blocking would otherwise turn
+one failed CPU into a pool change for every unit of the application.
+
+The pool counts as applied when both the snap's `cpu-pool` setting and the
+pool the daemon reports match the list. If the daemon still serves an older
+pool, the charm activates the setting again.
+
+Changing the list restarts the EPA orchestrator daemon. It does not move
+OSDs that already hold CPUs. Clearing the option returns to the calculated
+pool, which starts from the CPUs configured so far and only grows.
+
+The option only applies to an EPA orchestrator the charm installed. On a
+host where the snap was already present it is ignored, whatever its value,
+and reported as a profile warning. It is not looked at either while
+`performance-profile` is `unmanaged`.
+
+#### Interrupted changes
+
 Pool changes are journaled before configuring the snap. If configuration or
 restart is interrupted, the next managed reconciliation retries activation
 before checking daemon readiness, even when profile demand is unchanged.
-The pending change is cleared only after the general pool answers successfully.
+The pending change is cleared only after the general pool answers
+successfully. The one exception is a first attempt at an `epa-cpu-pool` list
+that `snap set` refuses: it is dropped, so that a corrected list is not held
+up by replaying the refused one.
 An old interrupted change made before this journal existed still requires
 `sudo snap restart epa-orchestrator.daemon` before retrying reconciliation;
 the charm does not infer permission to restart from arbitrary listing errors.

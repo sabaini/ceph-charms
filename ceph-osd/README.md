@@ -75,6 +75,10 @@ CPU counts of the 'performance' profile. Set both options at deployment time:
 changing them later restarts every affected OSD and is best done in a
 maintenance window.
 
+The CPUs these allocations are taken from are chosen by the charm when it
+installs the EPA orchestrator itself. The `epa-cpu-pool` option replaces that
+choice with an explicit CPU list.
+
 #### `source`
 
 The `source` option states the software sources. A common value is an OpenStack
