@@ -159,10 +159,36 @@ class PoolConfigurationTestCase(unittest.TestCase):
         self.assertRaises(epa_snap.SnapError, epa_snap.set_pool, [])
 
     def test_set_pool_failure(self):
-        self.run.side_effect = failure(['snap', 'set'], output=b'rejected')
+        self.run.side_effect = failure(
+            ['snap', 'set'], output=b'cpu-pool excludes\nclaimed CPUs')
+        with self.assertRaises(epa_snap.PoolRejected) as caught:
+            epa_snap.set_pool([1])
+        self.assertEqual(
+            str(caught.exception),
+            'EPA rejected CPU pool 1: cpu-pool excludes claimed CPUs')
+        # A refused setting leaves the daemon alone.
+        self.assertEqual(self.run.call_count, 1)
+
+    def test_set_pool_restart_failure_is_not_a_rejection(self):
+        self.run.side_effect = [
+            '', failure(['snap', 'restart'], output=b'timed out')]
         with self.assertRaises(epa_snap.SnapError) as caught:
             epa_snap.set_pool([1])
-        self.assertIn('rejected', str(caught.exception))
+        self.assertNotIsInstance(caught.exception, epa_snap.PoolRejected)
+        self.assertIn('timed out', str(caught.exception))
+
+    def test_parse_pool(self):
+        self.assertEqual(epa_snap.parse_pool(' 28 - 29, 8,9,8 '),
+                         [8, 9, 28, 29])
+        self.assertEqual(epa_snap.parse_pool('0'), [0])
+        for value in ('', ',', '12,', ',12,,13,', '1_2', '+3', '-3', '8-',
+                      '9-8', '0-7:2', '4.5', '0x10', 'all', '0-65536'):
+            self.assertRaises(ValueError, epa_snap.parse_pool, value)
+
+    def test_pool_cpus(self):
+        self.assertEqual(epa_snap.pool_cpus(None), [])
+        self.assertEqual(epa_snap.pool_cpus(' isolated\n'), [])
+        self.assertEqual(epa_snap.pool_cpus('2-3,8'), [2, 3, 8])
 
 
 class PoolComputationTestCase(unittest.TestCase):

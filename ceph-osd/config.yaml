@@ -561,9 +561,10 @@ options:
         {performance: {cpus: {nvme: 16, hdd: 6}}}
       .
       An invalid value blocks the unit. A count above 75% of a NUMA node's
-      logical CPUs is logged as a warning: when the charm manages the EPA
+      logical CPUs is logged as a warning: when the charm sizes the EPA
       orchestrator's CPU pool it offers at most that share of each node, so
-      such a count cannot be placed there. Like `performance-profile`, set
+      such a count cannot be placed there. Set `epa-cpu-pool` to offer more.
+      Like `performance-profile`, set
       this option at deployment time: changing it later triggers the same
       rolling restart.
   suppress-profile-warnings:
@@ -582,6 +583,38 @@ options:
       `epa-orchestrator` resource is attached and `performance-profile` is not
       `unmanaged`. An EPA orchestrator that is already installed on the host is
       always used as-is: neither its revision nor its CPU pool is modified.
+  epa-cpu-pool:
+    type: string
+    default: ""
+    description: |
+      Logical CPUs the EPA orchestrator may grant to OSDs on each unit, as a
+      CPU list such as `8-31,40-63`. Only used when the charm installed the
+      EPA orchestrator itself and `performance-profile` is not `unmanaged`.
+      .
+      By default the charm sizes this pool itself: per NUMA node the profile's
+      demand, at least 20% and at most 75% of the node's logical CPUs, never
+      CPU 0, and it only ever adds CPUs. Setting this option replaces that
+      calculation: the pool is exactly the given list, on every unit of the
+      application. Make sure it covers the profile's demand on each NUMA node
+      that hosts OSD devices; a pool that is too small is handled like any
+      other shortage, by blocking the unit under `performance` and degrading
+      with a warning under `balanced` and `minimal`.
+      .
+      The list is never adjusted. A unit blocks, and keeps its current pool,
+      if the value is not a CPU list, if it names CPUs that are not online on
+      that host or that are isolated (EPA keeps those in a separate pool), or
+      if a change would remove CPUs that are still claimed in EPA. These
+      checks apply when the pool is changed: a CPU that goes offline in a pool
+      that is already applied is reported as a warning instead, and EPA stops
+      granting it.
+      .
+      Changing the list restarts the EPA orchestrator daemon but does not move
+      OSDs that already hold CPUs. Clearing the option returns to the
+      calculated pool, which keeps the CPUs configured so far.
+      .
+      An EPA orchestrator that was already installed on the host keeps its
+      own CPU pool: there this option is ignored, whatever its value, and
+      reported as a warning.
   force-net-addr:
     type: boolean
     default: False

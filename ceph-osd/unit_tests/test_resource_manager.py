@@ -61,6 +61,8 @@ class FakeEpa(object):
         self.features = list(self.FEATURES if features is None else features)
         self.claims = dict(foreign or {})
         self.source = source
+        # Configured CPUs before online filtering; the eligible ones if None.
+        self.configured = None
         self.calls = []
 
     def _free(self, service=None):
@@ -77,7 +79,9 @@ class FakeEpa(object):
             'supported_cpu_features': self.features,
             'cpu_pool': {
                 'source': self.source,
-                'configured_cpus': format_cpu_list(self.eligible),
+                'configured_cpus': (
+                    format_cpu_list(self.eligible)
+                    if self.configured is None else self.configured),
                 'eligible_cpus': format_cpu_list(self.eligible),
                 'unavailable_allocated_cpus': '',
             },
@@ -2017,6 +2021,270 @@ class PoolManagementTestCase(ManagerTestCase):
         state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
         self.assertIn('no snapd', state['errors'][0])
         self.assertEqual(self.applied, [])
+
+
+class ExplicitPoolTestCase(ManagerTestCase):
+    """The operator's ``epa-cpu-pool`` replaces the computed pool."""
+
+    def setUp(self):
+        super(ExplicitPoolTestCase, self).setUp()
+        # The charm owns the EPA installation unless a test says otherwise.
+        self.kv.set(resource_manager.MANAGED_KEY, True)
+
+    def test_unset_pool_is_computed(self):
+        for value in (None, '', '  '):
+            self.config['epa-cpu-pool'] = value
+            self.assertIsNone(resource_manager.configured_pool())
+
+    def test_pool_is_parsed(self):
+        self.config['epa-cpu-pool'] = ' 28-31, 8,9 '
+        self.assertEqual(resource_manager.configured_pool(),
+                         [8, 9, 28, 29, 30, 31])
+
+    def test_invalid_pool_is_rejected(self):
+        # The last four are accepted by the lenient sysfs parser, but not
+        # by the snap, so they must not be repaired into a valid list.
+        for value in ('all', '8-', '-3', '9-8', '0-7:2', ',', '4.5',
+                      ',12,,13,', '12,', '1_2', '+3', '0-70000'):
+            self.config['epa-cpu-pool'] = value
+            with self.assertRaises(resource_manager.ResourceError) as caught:
+                resource_manager.configured_pool()
+            self.assertIn('invalid epa-cpu-pool', str(caught.exception))
+
+    def test_invalid_pool_blocks_without_allocating(self):
+        self.config['epa-cpu-pool'] = ',12,,13,'
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertIn('invalid epa-cpu-pool', state['errors'][0])
+        self.set_pool.assert_not_called()
+        self.assertEqual(epa.claims, {})
+
+    def test_invalid_pool_is_ignored_for_a_pre_existing_snap(self):
+        self.kv.set(resource_manager.MANAGED_KEY, False)
+        self.config['epa-cpu-pool'] = 'not-a-cpu-list'
+        epa = FakeEpa(range(0, 16), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(len(state['warnings']), 1)
+        self.assertIn('epa-cpu-pool is ignored', state['warnings'][0])
+        self.assertEqual(epa.claims['ceph-osd.0'], [0, 1])
+
+    def test_invalid_pool_does_not_block_an_unmanaged_profile(self):
+        self.config['epa-cpu-pool'] = 'not-a-cpu-list'
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_UNMANAGED, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.ensure_installed.assert_not_called()
+
+    def test_pool_is_exactly_the_configured_list(self):
+        # Neither the 20% floor nor the highest-core preference applies.
+        self.kv.set(resource_manager.MANAGED_KEY, False)
+        self.ensure_installed.return_value = 'store'
+        self.config['epa-cpu-pool'] = '2-3,18-19'
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(state['warnings'], [])
+        self.assertEqual(self.pools_set, ['2-3,18-19'])
+        self.assertEqual(state['epa']['eligible-cpus'], '2-3,18-19')
+        self.assertEqual(epa.claims['ceph-osd.0'], [2, 3])
+        self.assertIsNone(self.kv.get(resource_manager.PENDING_POOL_KEY))
+
+    def test_pool_can_exceed_the_computed_cap(self):
+        self.pool = '12-15,28-31'
+        self.config['epa-cpu-pool'] = '1-15,17-31'
+        epa = FakeEpa(parse_cpu_list(self.pool), TWO_NODES)
+        with patch.object(resource_manager, 'log') as log:
+            self.config['performance-profile-resources'] = (
+                '{performance: {cpus: 14}}')
+            state = self.reconcile(rp.PROFILE_PERFORMANCE, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(self.pools_set, ['1-15,17-31'])
+        self.assertEqual(len(epa.claims['ceph-osd.0']), 14)
+        # The 75% share only limits the pool the charm computes.
+        self.assertFalse([c for c in log.call_args_list
+                          if 'performance-profile-resources' in c[0][0]])
+
+    def test_pool_can_shrink(self):
+        self.pool = '4-15,20-31'
+        self.config['epa-cpu-pool'] = '12-15,28-31'
+        epa = FakeEpa(parse_cpu_list(self.pool), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(self.pools_set, ['12-15,28-31'])
+        self.assertEqual(epa.claims['ceph-osd.0'], [12, 13])
+
+    def test_unchanged_pool_is_not_reconfigured(self):
+        self.pool = '12-15,28-31'
+        self.config['epa-cpu-pool'] = '28-31,12-15'
+        epa = FakeEpa(parse_cpu_list(self.pool), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.set_pool.assert_not_called()
+
+    def test_offline_cpu_in_an_applied_pool_warns(self):
+        # One host losing a CPU must not force a pool change on the whole
+        # application: EPA keeps granting the online part.
+        self.pool = '12-15,28-31'
+        self.config['epa-cpu-pool'] = '12-15,28-31'
+        nodes = {0: list(range(0, 15)), 1: list(range(16, 32))}
+        epa = FakeEpa(parse_cpu_list('12-14,28-31'), nodes)
+        epa.configured = self.pool
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa,
+                               nodes=nodes)
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(state['warnings'], [
+            'epa-cpu-pool names CPUs that are not online on this host and '
+            'cannot be granted: 15'])
+        self.set_pool.assert_not_called()
+        self.assertEqual(epa.claims['ceph-osd.0'], [12, 13])
+
+    def test_setting_the_daemon_has_not_picked_up_is_activated(self):
+        # The snap setting already matches, but the daemon still serves
+        # the pool it started with and no activation is journaled.
+        self.pool = '12-15,28-31'
+        self.config['epa-cpu-pool'] = '12-15,28-31'
+        epa = FakeEpa(parse_cpu_list('4-15,20-31'), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(self.pools_set, ['12-15,28-31'])
+        self.assertEqual(epa.claims['ceph-osd.0'], [12, 13])
+
+    def test_unapplied_setting_keeps_cpus_the_daemon_has_granted(self):
+        self.pool = '12-15,28-31'
+        self.config['epa-cpu-pool'] = '12-15,28-31'
+        epa = FakeEpa(parse_cpu_list('4-15,20-31'), TWO_NODES,
+                      foreign={'nova-compute': [4, 5]})
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [
+            'epa-cpu-pool would remove CPUs that are still claimed: '
+            'nova-compute (4-5)'])
+        self.set_pool.assert_not_called()
+
+    def test_failed_replay_keeps_the_pending_activation(self):
+        # An earlier attempt committed the setting but did not restart the
+        # daemon. A failing replay proves nothing about that restart.
+        self.pool = '12-15,28-31'
+        self.config['epa-cpu-pool'] = '12-15,28-31'
+        pending = parse_cpu_list(self.pool)
+        self.kv.set(resource_manager.PENDING_POOL_KEY, pending)
+        epa = FakeEpa(parse_cpu_list('4-15,20-31'), TWO_NODES)
+        self.set_pool.side_effect = resource_manager.epa_snap.PoolRejected(
+            'EPA rejected CPU pool 12-15,28-31: cannot communicate')
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertIn('cannot communicate', state['errors'][0])
+        self.assertEqual(self.kv.get(resource_manager.PENDING_POOL_KEY),
+                         pending)
+        self.assertEqual(epa.claims, {})
+
+        self.set_pool.side_effect = self._set_pool
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(self.pools_set, ['12-15,28-31'])
+        self.assertIsNone(self.kv.get(resource_manager.PENDING_POOL_KEY))
+        self.assertEqual(epa.claims['ceph-osd.0'], [12, 13])
+
+    def test_shrinking_below_claimed_cpus_blocks(self):
+        self.pool = '4-15,20-31'
+        self.config['epa-cpu-pool'] = '12-15,28-31'
+        epa = FakeEpa(parse_cpu_list(self.pool), TWO_NODES,
+                      foreign={'nova-compute': [4, 5, 12],
+                               'ceph-osd.0': [6, 7]})
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [
+            'epa-cpu-pool would remove CPUs that are still claimed: '
+            'ceph-osd.0 (6-7), nova-compute (4-5)'])
+        self.set_pool.assert_not_called()
+        self.assertIsNone(self.kv.get(resource_manager.PENDING_POOL_KEY))
+        self.assertEqual(self.applied, [])
+
+    def test_cpus_missing_on_the_host_block(self):
+        self.pool = '12-15,28-31'
+        self.config['epa-cpu-pool'] = '12-15,28-35'
+        epa = FakeEpa(parse_cpu_list(self.pool), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [
+            'epa-cpu-pool names CPUs that are not online on this host: '
+            '32-35'])
+        self.set_pool.assert_not_called()
+        self.assertEqual(epa.claims, {})
+
+    def test_isolated_cpus_block(self):
+        self.config['epa-cpu-pool'] = '10-15'
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        original = epa.wait_ready
+
+        def wait_ready(discover=False, **kwargs):
+            listing = original(discover=discover, **kwargs)
+            if discover:
+                listing['cpu_pool']['configured_cpus'] = '12-15,28-31'
+            return listing
+
+        epa.wait_ready = wait_ready
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [
+            'epa-cpu-pool includes isolated CPUs, which EPA keeps in a '
+            'separate pool: 12-15'])
+        self.set_pool.assert_not_called()
+
+    def test_cpu_zero_is_allowed_with_a_warning(self):
+        self.config['epa-cpu-pool'] = '0-3'
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        with patch.object(resource_manager, 'log') as log:
+            state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(self.pools_set, ['0-3'])
+        self.assertTrue([c for c in log.call_args_list
+                         if c[1].get('level') == resource_manager.WARNING and
+                         'includes CPU 0' in c[0][0]])
+
+    def test_pool_is_ignored_for_a_pre_existing_snap(self):
+        self.kv.set(resource_manager.MANAGED_KEY, False)
+        self.config['epa-cpu-pool'] = '12-15,28-35'
+        epa = FakeEpa(range(0, 16), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(len(state['warnings']), 1)
+        self.assertIn('epa-cpu-pool is ignored', state['warnings'][0])
+        self.set_pool.assert_not_called()
+        self.get_configured_pool.assert_not_called()
+        self.assertEqual(epa.claims['ceph-osd.0'], [0, 1])
+
+    def test_too_small_pool_blocks_a_strict_profile(self):
+        self.config['epa-cpu-pool'] = '8-15'
+        epa = FakeEpa(range(0, 32), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_PERFORMANCE, [osd(0)], epa)
+        self.assertEqual(self.pools_set, ['8-15'])
+        self.assertIn('needs more CPUs', state['errors'][0])
+        self.assertEqual(epa.claims, {})
+
+    def test_rejected_pool_can_be_corrected(self):
+        self.pool = '12-15,28-31'
+        self.config['epa-cpu-pool'] = '8-15'
+        epa = FakeEpa(parse_cpu_list(self.pool), TWO_NODES)
+        self.set_pool.side_effect = resource_manager.epa_snap.PoolRejected(
+            'EPA rejected CPU pool 8-15: excludes existing owners')
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [
+            'EPA rejected CPU pool 8-15: excludes existing owners'])
+        self.assertEqual(self.pool, '12-15,28-31')
+        # Nothing was changed, so nothing is replayed on the next attempt.
+        self.assertIsNone(self.kv.get(resource_manager.PENDING_POOL_KEY))
+        self.assertEqual(epa.claims, {})
+
+        self.set_pool.side_effect = self._set_pool
+        self.config['epa-cpu-pool'] = '8-15,28-31'
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        self.assertEqual(self.pools_set, ['8-15,28-31'])
+
+    def test_clearing_the_option_keeps_and_grows_the_pool(self):
+        self.pool = '2-3,18-19'
+        epa = FakeEpa(parse_cpu_list(self.pool), TWO_NODES)
+        state = self.reconcile(rp.PROFILE_MINIMAL, [osd(0)], epa)
+        self.assertEqual(state['errors'], [])
+        # The computed 20% floor is merged into the former explicit pool.
+        self.assertEqual(self.pools_set, ['2-3,12-15,18-19,28-31'])
 
 
 class VerifyTestCase(ManagerTestCase):

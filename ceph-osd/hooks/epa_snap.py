@@ -21,10 +21,12 @@ another charm, so neither its channel nor its ``cpu-pool`` is touched.
 When the charm installs the snap itself it also owns the general CPU pool:
 a conservative share of each NUMA node's non-isolated logical CPUs, grown
 as profile demand requires. EPA's default isolated pool stays separate.
+The operator can replace that computed pool with an explicit CPU list.
 """
 
 import math
 import os
+import re
 import subprocess
 
 from charmhelpers.core.hookenv import (
@@ -53,10 +55,31 @@ DEFAULT_POOL_PERCENT = 20
 # Never hand more than this share of a node to EPA, so that host and
 # non-OSD workloads retain capacity.
 MAX_POOL_PERCENT = 75
+# The CPU list syntax and ID limit the snap accepts for ``cpu-pool``.
+POOL_COMPONENT = re.compile(r'([0-9]+)(?:\s*-\s*([0-9]+))?')
+MAX_CPU_ID = 65535
 
 
 class SnapError(Exception):
     """Raised when the EPA orchestrator snap cannot be managed."""
+
+
+class PoolRejected(SnapError):
+    """Raised when ``snap set`` fails for a ``cpu-pool`` setting.
+
+    The daemon was not restarted. This is normally the snap's configure
+    hook refusing the list, which keeps the previous setting. The command
+    can fail for other reasons too, so this alone does not prove which
+    pool is configured or active.
+    """
+
+
+def _failure_output(exc):
+    """Return the readable output of a failed command."""
+    output = getattr(exc, 'output', None)
+    if isinstance(output, bytes):
+        output = output.decode('UTF-8', 'replace')
+    return ' '.join(str(output or exc).split())
 
 
 def _run(command):
@@ -163,17 +186,25 @@ def set_pool(cpus):
     :type cpus: iterable[int]
     :returns: the pool string that was configured
     :rtype: str
+    :raises PoolRejected: the snap refused the setting and kept its pool
+    :raises SnapError: the pool was set but could not be activated
     """
     pool = format_cpu_list(cpus)
     if not pool:
         raise SnapError('refusing to configure an empty EPA CPU pool')
     try:
         _run(['snap', 'set', SNAP_NAME, '{}={}'.format(POOL_KEY, pool)])
+    except subprocess.CalledProcessError as exc:
+        raise PoolRejected('EPA rejected CPU pool {}: {}'.format(
+            pool, _failure_output(exc)))
+    except OSError as exc:
+        raise SnapError('cannot configure EPA CPU pool {}: {}'.format(
+            pool, exc))
+    try:
         _run(['snap', 'restart', DAEMON])
     except (subprocess.CalledProcessError, OSError) as exc:
-        output = getattr(exc, 'output', exc)
-        raise SnapError('cannot configure EPA CPU pool {}: {}'.format(
-            pool, output))
+        raise SnapError('cannot activate EPA CPU pool {}: {}'.format(
+            pool, _failure_output(exc)))
     # The restarted daemon rebinds its socket, so wait for it to answer
     # before the caller relies on the new pool.
     try:
@@ -255,6 +286,51 @@ def compute_pool(nodes, demand_by_node=None, unbound_demand=0,
     return sorted(pool)
 
 
+def pool_cpus(setting):
+    """Return the logical CPUs of a ``cpu-pool`` snap setting.
+
+    An unset pool and the ``isolated`` keyword both mean that no general
+    pool is configured.
+
+    :param setting: raw snap setting, or None
+    :type setting: str or None
+    :rtype: list[int]
+    """
+    if setting is None or setting.strip() == 'isolated':
+        return []
+    return parse_cpu_list(setting)
+
+
+def parse_pool(value):
+    """Parse an operator supplied CPU pool, as strictly as the snap does.
+
+    The kernel style parser used for sysfs tolerates empty components and
+    Python integer syntax. An operator's list is held to the grammar the
+    snap accepts instead, so that a typo is reported rather than repaired.
+
+    :param value: CPU list such as ``8-31,40-63``
+    :type value: str
+    :returns: sorted logical CPU IDs
+    :rtype: list[int]
+    :raises ValueError: the value is not a CPU list
+    """
+    cpus = set()
+    for component in value.split(','):
+        match = POOL_COMPONENT.fullmatch(component.strip())
+        if not match:
+            raise ValueError('invalid CPU list component {!r}'.format(
+                component))
+        start = int(match.group(1))
+        end = start if match.group(2) is None else int(match.group(2))
+        if end < start:
+            raise ValueError('descending CPU range {!r}'.format(component))
+        if end > MAX_CPU_ID:
+            raise ValueError('CPU ID above {} in {!r}'.format(
+                MAX_CPU_ID, component))
+        cpus.update(range(start, end + 1))
+    return sorted(cpus)
+
+
 def grow_pool(current, desired):
     """Merge a desired pool into the current one without shrinking.
 
@@ -269,8 +345,7 @@ def grow_pool(current, desired):
     :returns: tuple of (merged CPU IDs, whether a change is needed)
     :rtype: tuple[list[int], bool]
     """
-    existing = set(parse_cpu_list(
-        '' if current is None or current.strip() == 'isolated' else current))
+    existing = set(pool_cpus(current))
     wanted = set(desired)
     merged = sorted(existing | wanted)
     return merged, merged != sorted(existing)

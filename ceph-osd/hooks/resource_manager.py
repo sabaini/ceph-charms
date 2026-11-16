@@ -155,6 +155,29 @@ def configured_overrides():
                 ' '.join(str(exc).split())))
 
 
+def _pool_option():
+    """Return the raw ``epa-cpu-pool`` option, empty when unset."""
+    return str(_config('epa-cpu-pool', '') or '').strip()
+
+
+def configured_pool():
+    """Return the operator's explicit EPA CPU pool, if any.
+
+    :returns: sorted logical CPU IDs, or None when the option is unset
+    :rtype: list[int] or None
+    :raises ResourceError: the configured value is not a CPU list
+    """
+    value = _pool_option()
+    if not value:
+        return None
+    try:
+        return epa_snap.parse_pool(value)
+    except ValueError as exc:
+        raise ResourceError(
+            'invalid epa-cpu-pool {!r} ({}), expected a CPU list such as '
+            '8-31,40-63'.format(value, exc))
+
+
 def _warn_oversized_overrides(profile, overrides, nodes):
     """Log overridden CPU counts that exceed a node's share of the pool.
 
@@ -1069,12 +1092,17 @@ def _pool_demand(plan, host, listing, own_services):
     return demand
 
 
-def _activate_epa_pool(cpus, client):
+def _activate_epa_pool(cpus, client, discard_rejected=False):
     """Journal pool activation across snap configuration and daemon restart.
 
     The caller has established ownership and capability support before creating
     this intent. Replay it before probing readiness: the previous restart may
     have left the daemon stopped or still serving its old pool.
+
+    :param discard_rejected: drop the intent when ``snap set`` fails. Only
+        for a first attempt whose caller compares the pool the daemon serves
+        on every reconciliation; a replayed intent is always retained.
+    :type discard_rejected: bool
     """
     database = kv()
     database.set(PENDING_POOL_KEY, list(cpus))
@@ -1082,6 +1110,13 @@ def _activate_epa_pool(cpus, client):
     try:
         epa_snap.set_pool(cpus)
         listing = client.wait_ready()
+    except epa_snap.PoolRejected as exc:
+        if discard_rejected:
+            # Replaying a list the snap refuses would keep the unit blocked
+            # after the operator corrects it.
+            database.set(PENDING_POOL_KEY, None)
+            database.flush()
+        raise ResourceError(str(exc))
     except (epa_snap.SnapError, EpaError) as exc:
         raise ResourceError(str(exc))
     database.set(PENDING_POOL_KEY, None)
@@ -1089,10 +1124,86 @@ def _activate_epa_pool(cpus, client):
     return listing
 
 
+def _apply_explicit_pool(pool, configured, host, discovery, listing, client):
+    """Make the operator's ``epa-cpu-pool`` the charm-owned general pool.
+
+    Unlike the computed pool this list is authoritative: it is neither
+    sized by profile demand nor merged into the current pool, so it can
+    also shrink the pool. A list this host cannot honour is refused
+    instead of being adjusted, and so is one that drops CPUs EPA has
+    already granted.
+
+    The pool counts as applied only when both the snap setting and the
+    pool the daemon serves match the list. A setting the daemon has not
+    picked up is activated again, whatever happened to the attempt that
+    wrote it.
+
+    :param pool: logical CPU IDs requested by the operator
+    :type pool: list[int]
+    :param configured: current ``cpu-pool`` snap setting, or None
+    :type configured: str or None
+    :returns: tuple of (general pool listing, warnings)
+    :rtype: tuple[dict, list[str]]
+    :raises ResourceError: the list cannot be used on this host
+    """
+    wanted = set(pool)
+    setting = set(epa_snap.pool_cpus(configured))
+    serving = (listing.get('cpu_pool') or {}).get('configured_cpus')
+    if serving is not None:
+        serving = set(parse_cpu_list(serving))
+    online = set()
+    for cpus in host.nodes.values():
+        online.update(cpus)
+    missing = wanted - online
+
+    if wanted == setting and serving in (None, wanted):
+        # EPA keeps serving the online part of an applied pool. Blocking
+        # here would turn one failed CPU into a pool change for the whole
+        # application, so only report it.
+        warnings = []
+        if missing:
+            warnings.append(
+                'epa-cpu-pool names CPUs that are not online on this host '
+                'and cannot be granted: {}'.format(format_cpu_list(missing)))
+        return listing, warnings
+
+    if missing:
+        raise ResourceError(
+            'epa-cpu-pool names CPUs that are not online on this host: '
+            '{}'.format(format_cpu_list(missing)))
+    isolated = wanted & set(parse_cpu_list(
+        (discovery.get('cpu_pool') or {}).get('configured_cpus') or ''))
+    if isolated:
+        raise ResourceError(
+            'epa-cpu-pool includes isolated CPUs, which EPA keeps in a '
+            'separate pool: {}'.format(format_cpu_list(isolated)))
+    removed = (setting | (serving or set())) - wanted
+    held = []
+    for name, entry in sorted(allocations_by_service(listing).items()):
+        cores = removed & set(entry['cores'])
+        if cores:
+            held.append('{} ({})'.format(name, format_cpu_list(cores)))
+    if held:
+        raise ResourceError(
+            'epa-cpu-pool would remove CPUs that are still claimed: '
+            '{}'.format(', '.join(held)))
+
+    if 0 in wanted:
+        log('epa-cpu-pool includes CPU 0, which is normally left for host '
+            'housekeeping', level=WARNING)
+    log('Setting the EPA CPU pool to epa-cpu-pool {} (was {})'.format(
+        format_cpu_list(wanted),
+        format_cpu_list(setting if serving is None else serving) or 'unset'),
+        level=INFO)
+    listing = _activate_epa_pool(
+        sorted(wanted), client, discard_rejected=True)
+    return listing, []
+
+
 def _ensure_epa(plan, host, own_services, client_factory=EpaClient):
     """Ensure the EPA orchestrator is installed and has capacity.
 
-    :returns: tuple of (client, listing, epa state dict)
+    :returns: tuple of (client, listing, epa state dict, warnings)
     :raises ResourceError: EPA is unusable for the requested profile
     """
     try:
@@ -1138,7 +1249,14 @@ def _ensure_epa(plan, host, own_services, client_factory=EpaClient):
             listing = client.list_allocations()
         except EpaError as exc:
             raise ResourceError(str(exc))
-    if charm_managed:
+    # ``epa-cpu-pool`` only applies to a pool the charm owns, so it is not
+    # even validated elsewhere: an ignored option must not block the unit.
+    explicit = bool(_pool_option())
+    warnings = []
+    if charm_managed and explicit:
+        listing, warnings = _apply_explicit_pool(
+            configured_pool(), configured, host, discovery, listing, client)
+    elif charm_managed:
         desired = epa_snap.compute_pool(
             host.nodes,
             demand_by_node=_pool_demand(plan, host, listing, own_services),
@@ -1150,6 +1268,10 @@ def _ensure_epa(plan, host, own_services, client_factory=EpaClient):
             configured, desired)
         if changed:
             listing = _activate_epa_pool(merged, client)
+    elif explicit:
+        warnings.append(
+            'epa-cpu-pool is ignored: the EPA orchestrator on this host '
+            'was not installed by the charm, so its CPU pool is left as-is')
 
     epa_state = {
         'charm-managed': charm_managed,
@@ -1157,7 +1279,7 @@ def _ensure_epa(plan, host, own_services, client_factory=EpaClient):
         'source': pool_source(listing),
         'eligible-cpus': format_cpu_list(eligible_cpus(listing)),
     }
-    return client, listing, epa_state
+    return client, listing, epa_state, warnings
 
 
 def reconcile(client_factory=EpaClient):
@@ -1285,7 +1407,9 @@ def reconcile(client_factory=EpaClient):
         _save_state(state)
         return state
 
-    _warn_oversized_overrides(profile, overrides, host.nodes)
+    if not _pool_option():
+        # The share limit only applies to the pool the charm computes.
+        _warn_oversized_overrides(profile, overrides, host.nodes)
     plan = build_plan(profile, osds, host, overrides)
     state['warnings'] = list(plan.warnings) + plan.deviations()
     if not plan.satisfiable:
@@ -1299,13 +1423,14 @@ def reconcile(client_factory=EpaClient):
     own_services = set(service_name_for(osd_id) for osd_id in local_ids)
 
     try:
-        client, listing, epa_state = _ensure_epa(
+        client, listing, epa_state, pool_warnings = _ensure_epa(
             plan, host, own_services, client_factory)
     except ResourceError as exc:
         state['errors'] = [str(exc)]
         _save_state(state)
         return state
     state['epa'] = epa_state
+    state['warnings'].extend(pool_warnings)
 
     if _release_stale_claims(client, listing, local_ids, state):
         # The released CPUs are free again; do not refuse a plan over them.
